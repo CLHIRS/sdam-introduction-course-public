@@ -1,0 +1,74 @@
+[tool.poetry]
+name = "sdam-introduction"
+version = "0.2.0"
+description = "This course builds a unified foundation for sequential decision problems under uncertainty, following Warren B. Powell’s Sequential Decision Analytics and Modeling with Python. It integrates modeling, simulation, optimization, and learning — moving from system representation to policy design and approximation architectures."
+authors = ["CLHIRS"]
+license = "MIT License"
+readme = "README.md"
+
+# Phase 2 (safe refactor): make the teaching modules importable without
+# Historically, notebooks relied on setting `PYTHONPATH` to the old teaching tree
+# or used ad-hoc `sys.path` setup cells.
+packages = [
+	{ include = "inventory", from = "src" },
+	{ include = "queueing", from = "src" },
+	{ include = "scenarios", from = "src" },
+	{ include = "helpers", from = "src" },
+]
+
+[tool.poetry.scripts]
+sdam-scenarios = "scenarios.run_all:main"
+sdam-inventory-smoke = "inventory.evaluation.smoke_canonical:main"
+sdam-forecast-benchmark = "inventory.evaluation.forecast_benchmark:main"
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.15"
+notebook = "^7.5.0"
+scikit-learn = "^1.7.2"
+pandas = "^2.3.3"
+matplotlib = "^3.10.7"
+arviz = "^0.23.0"
+pymc = "^5.27.0"
+torch = "^2.10.0"
+scipy = "^1.17.0"
+ruff = "^0.15.4"
+pytest = "^9.0.2"
+statsmodels = "^0.14.6"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+# Keep linting focused on maintained Python sources.
+extend-exclude = [
+	"*.ipynb",
+	"**/.ipynb_checkpoints/**",
+	"lectures/_hist/**",
+]
+
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = [
+	"E101", # allow tab-indented notebook-exported modules
+	"E402", # notebooks / teaching scripts often import after path setup
+	"E731", # allow small lambdas in factories and teaching code
+	"E741", # allow I, l, O in inventory notation
+	"E501", # keep lecture code readable; don't enforce line length
+	"W191", # allow tabs (pairs with E101 ignore)
+]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["archive", "lectures", "experiments", ".venv", "dist", "build"]
+
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
