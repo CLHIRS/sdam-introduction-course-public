@@ -6,11 +6,11 @@ This repository accompanies a graduate‑level lecture introducing how to **mode
 
 The course follows the unified framework proposed in:
 
-> Powell, W. – *Sequential Decision Analytics and Modeling: Modeling with Python* (2026)
+> [Powell, W. – *Sequential Decision Analytics and Modeling: Modeling with Python* (2026)](https://castle.princeton.edu/wp-content/uploads/2026/02/Powell-Kindle-SDAM-2nd-ed-Feb-9-2026-w_cover.pdf)
 
 Please find an extensive list of resources regarding Sequential Decision Analytics and Modeling provided by Powell here:
 
-> [Sequential Decision Analytics and Modeling](https://www.linkedin.com/safety/go?url=https%3A%2F%2Ftinyurl.com%2Fsdalinks%2F&trk=flagship-messaging-web&messageThreadUrn=urn%3Ali%3AmessagingThread%3A2-YWU4ZDIzY2UtZWRmZS00OTY5LWIxZmQtMTMyYTQ2MzZmYjQ5XzEwMA%3D%3D&lipi=urn%3Ali%3Apage%3Ad_flagship3_messaging_conversation_detail%3BKKiqgubITUS%2BiYYLBxbByQ%3D%3D)
+> [Sequential Decision Analytics and Modeling](https://castle.princeton.edu/sdalinks/)
 
 ---
 
