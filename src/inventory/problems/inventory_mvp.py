@@ -98,6 +98,51 @@ def inventory_cost_extended(
     return float(purchase_cost + setup_cost + holding_cost + stockout_penalty - revenue)
 
 
+def inventory_cost_extended_capped(
+    state: State,
+    action: Action,
+    exog: Exog,
+    t: int,
+    *,
+    p: float = 2.0,
+    c: float = 0.5,
+    h: float = 0.03,
+    b: float = 6.0,
+    K: float = 50.0,
+    s_max: int,
+) -> float:
+    """Extended one-step cost consistent with ``inventory_transition_regime_capped``.
+
+    Applies the same pre-demand warehouse cap that the transition function uses:
+    the effective order quantity is clipped so that ``inv + order <= s_max``.
+    This ensures the cost function and transition function see identical on-hand
+    inventory, eliminating the phantom-revenue artifact that arises when a
+    policy targets a level above ``s_max``.
+
+    Use this together with ``inventory_transition_regime_capped(s_max=s_max)``
+    to get a consistent (transition, cost) pair.
+    """
+    inv = float(state[0])
+    order = float(action[0])
+    demand = float(exog[0])
+
+    # Mirror the pre-demand cap from inventory_transition_regime_capped:
+    effective_order = max(0.0, min(order, float(s_max) - inv))
+
+    on_hand = inv + effective_order
+    sales = min(on_hand, demand)
+    lost = max(0.0, demand - on_hand)
+    inv_end = max(0.0, on_hand - demand)
+
+    revenue = float(p) * sales
+    purchase_cost = float(c) * order # note: purchase cost is still based on the actual order quantity, not the effective order. If he orders more than he can store, he makes a loss.
+    setup_cost = float(K) if order > 0.0 else 0.0
+    holding_cost = float(h) * inv_end
+    stockout_penalty = float(b) * lost
+
+    return float(purchase_cost + setup_cost + holding_cost + stockout_penalty - revenue)
+
+
 def inventory_transition(state: State, action: Action, exog: Exog, t: int) -> State:
     """Baseline inventory transition.
 
@@ -141,18 +186,31 @@ def inventory_transition(state: State, action: Action, exog: Exog, t: int) -> St
 
 
 def inventory_transition_capped_1d(state: State, action: Action, exog: Exog, t: int, *, s_max: int) -> State:
+    """1D inventory transition with pre-demand warehouse cap.
+
+    The cap is enforced **pre-demand**: on-hand stock is clipped to s_max before
+    demand is realised.  Ordering more than (s_max - inv) is physically impossible
+    — excess units are simply not received.  This matches the semantics of
+    ``inventory_transition_regime_capped`` and the internal model used by
+    ``DynamicProgrammingSolver1D`` (which restricts actions to x <= S_max - inv).
+    """
     inv = float(state[0])
     order = float(action[0])
     demand = float(exog[0])
 
-    inv_next = inv + order - demand
-    inv_next = max(0.0, inv_next)
-    inv_next = min(float(s_max), inv_next)
+    on_hand = min(inv + order, float(s_max))  # pre-demand cap: excess units not received
+    inv_next = max(0.0, on_hand - demand)
     return np.array([inv_next], dtype=float)
 
 
 def inventory_transition_regime_capped(state: State, action: Action, exog: Exog, t: int, *, s_max: int) -> State:
     """Regime-observable transition with nonnegativity + capacity cap.
+
+    The warehouse cap is enforced **pre-demand**: the received on-hand level is
+    clipped to s_max before demand is realised.  This means ordering more than
+    (s_max - inv) is physically impossible — excess units are simply not received.
+    This matches the DP internal model in DPSolverMultiRegimeExact, which also
+    clips on_hand = min(inv + x, S_max) before computing inv_end.
 
     Supports the common 2D case (inventory + 1 regime) and also the multi-regime
     case where additional observable regime components are appended to the state.
@@ -162,9 +220,8 @@ def inventory_transition_regime_capped(state: State, action: Action, exog: Exog,
     order = float(action[0])
     demand = float(exog[0])
 
-    inv_next = inv + order - demand
-    inv_next = max(0.0, inv_next)
-    inv_next = min(float(s_max), inv_next)
+    on_hand = min(inv + order, float(s_max))  # pre-demand cap: warehouse cannot overflow
+    inv_next = max(0.0, on_hand - demand)
 
     d_s = int(state.shape[0])
     if d_s == 1:
@@ -213,7 +270,7 @@ def make_inventory_mvp_system(
         if getattr(exogenous_model, "regime_index", None) is not None and hasattr(exogenous_model, "P"):
             d_s = 2
         elif all(hasattr(exogenous_model, a) for a in ("P_season", "P_day", "P_weather")):
-            d_s = 4
+            d_s = 4 if getattr(exogenous_model, "observable_regimes", True) else 1
         else:
             d_s = 1
 
@@ -236,7 +293,7 @@ def make_inventory_mvp_system(
         sim_seed=int(sim_seed),
         d_s=d_s,
         d_x=1,
-        d_w=int(d_s) if int(d_s) > 1 else 1,
+        d_w=int(d_s) if int(d_s) > 1 and getattr(exogenous_model, "observable_regimes", True) else 1,
     )
 
 
@@ -290,6 +347,7 @@ __all__ = [
     "InventoryCostParams",
     "inventory_cost",
     "inventory_cost_extended",
+    "inventory_cost_extended_capped",
     "inventory_transition",
     "inventory_transition_capped_1d",
     "inventory_transition_regime_capped",
