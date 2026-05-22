@@ -623,10 +623,187 @@ class OrderUpToStateDependentPFA(Policy):
         return self
 
 
+# ------------------------
+# Direct action (S_t → x) PFA
+# ------------------------
+@dataclass
+class DirectActionPFA(Policy):
+    """Direct state-to-action PFA: learns x = f(phi(S_t, t)) with any sklearn regressor.
+
+    Student view (the *idea*):
+    - Instead of committing to the order-up-to structure (compute a target level,
+      then derive x from it), we ask the regressor to predict the order quantity x
+      directly from the state features.
+    - Training is structurally identical to OrderUpToStateDependentPFA: rollout
+      improvement generates (state, best_action) supervised labels, then we call
+      regressor.fit(X, y).
+    - The key insight: the labelling problem is the same whether the output space
+      is "target levels" or "order quantities". The non-differentiable simulator
+      forces rollout labelling in both cases.
+
+    Engineering view (the *implementation*):
+    - The regressor predicts x directly; no base-stock conversion step.
+    - Candidates are order quantities in [0, x_max], not target levels.
+    - Everything else (CRN rollouts, _OneStepOverridePolicy, iterative loop) is
+      identical to OrderUpToStateDependentPFA.
+    """
+
+    system: DynamicSystemMVP
+    regressor: Regressor
+    x_max: float = 480.0
+    dx: int = 1
+    H: int = 5
+    feature_fn: Optional[Callable] = None
+    is_fitted: bool = False
+
+    def __post_init__(self) -> None:
+        self.x_max = float(self.x_max)
+        self.dx = int(self.dx)
+        self.H = int(self.H)
+        if self.feature_fn is None:
+            self.feature_fn = lambda s, t: [float(s[0]), float(t)]
+
+    def __repr__(self) -> str:
+        fitted = "fitted" if self.is_fitted else "unfitted"
+        return (
+            f"DirectActionPFA("
+            f"regressor={self.regressor!r}, "
+            f"x_max={self.x_max}, dx={self.dx}, H={self.H}, "
+            f"status={fitted})"
+        )
+
+    def _project_action(self, x: float) -> float:
+        x = float(np.clip(float(x), 0.0, self.x_max))
+        return _round_to_grid(x, self.dx)
+
+    def act(self, state: State, t: int, info: Optional[dict] = None) -> Action:
+        if not self.is_fitted:
+            # fallback: order half of x_max until trained
+            return np.array([self._project_action(0.5 * self.x_max)], dtype=float)
+        assert self.feature_fn is not None
+        feats = np.asarray(self.feature_fn(state, int(t)), dtype=float).reshape(1, -1)
+        x = float(np.asarray(self.regressor.predict(feats)).reshape(-1)[0])
+        return np.array([self._project_action(x)], dtype=float)
+
+    def _evaluate_candidate_action_at_state(
+        self,
+        *,
+        state: State,
+        t: int,
+        x0: float,
+        base_policy: Policy,
+        step_seeds: np.ndarray,
+        info: Optional[dict] = None,
+    ) -> float:
+        pol = _OneStepOverridePolicy(base_policy=base_policy, x0=x0)
+        suffix = np.asarray(step_seeds, dtype=np.int64)[int(t) : int(t) + self.H]
+        if suffix.shape[0] == 0:
+            return 0.0
+        _, costs, _, _ = self.system.simulate_crn(pol, state, suffix, info=info)
+        return float(costs.sum())
+
+    def collect_training_data(
+        self,
+        *,
+        S0: State,
+        T: int,
+        n_episodes: int,
+        seed0: int,
+        behavior_policy: Policy,
+        base_policy_for_rollout: Policy,
+        candidate_actions: Sequence[float],
+        info: Optional[dict] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect (features, best_action) labels from visited states.
+
+        Structurally identical to OrderUpToStateDependentPFA.collect_training_data,
+        except candidates are order quantities rather than target levels.
+        """
+        candidate_actions = [self._project_action(float(a)) for a in candidate_actions]
+        rng = np.random.default_rng(int(seed0))
+
+        X_rows: List[np.ndarray] = []
+        y_rows: List[float] = []
+
+        for ep_seed in rng.integers(1, 2**31 - 1, size=int(n_episodes)):
+            step_seeds = self.system.sample_crn_step_seeds(int(ep_seed), int(T))
+            traj, _, _, _ = self.system.simulate_crn(behavior_policy, S0, step_seeds, info=info)
+
+            for t in range(int(T)):
+                state = traj[t]
+                vals = [
+                    self._evaluate_candidate_action_at_state(
+                        state=state,
+                        t=t,
+                        x0=a,
+                        base_policy=base_policy_for_rollout,
+                        step_seeds=step_seeds,
+                        info=info,
+                    )
+                    for a in candidate_actions
+                ]
+                best = float(candidate_actions[int(np.argmin(vals))])
+                feats = np.asarray(self.feature_fn(state, int(t)), dtype=float)  # type: ignore[misc]
+                X_rows.append(feats)
+                y_rows.append(best)
+
+        X = np.vstack([r.reshape(1, -1) for r in X_rows]) if X_rows else np.zeros((0, 0), dtype=float)
+        y = np.asarray(y_rows, dtype=float)
+        return X, y
+
+    def fit_via_rollout_improvement(
+        self,
+        *,
+        S0: State,
+        T: int,
+        n_episodes: int = 60,
+        seed0: int = 1234,
+        n_iter: int = 3,
+        candidate_actions: Optional[Sequence[float]] = None,
+        behavior_policy: Optional[Policy] = None,
+        info: Optional[dict] = None,
+    ) -> "DirectActionPFA":
+        """Iterative rollout-improvement loop for the direct-action policy.
+
+        Identical in structure to OrderUpToStateDependentPFA.fit_via_rollout_improvement;
+        the only difference is that candidates are order quantities, not target levels.
+        """
+        if candidate_actions is None:
+            candidate_actions = list(np.linspace(0.0, self.x_max, num=21))
+
+        if behavior_policy is None:
+            behavior_policy = OrderUpToPolicy(
+                target_level=0.5 * self.x_max, x_max=self.x_max, dx=self.dx
+            )
+
+        base_for_rollout: Policy = self if self.is_fitted else behavior_policy
+
+        for it in range(int(n_iter)):
+            X, y = self.collect_training_data(
+                S0=S0,
+                T=T,
+                n_episodes=n_episodes,
+                seed0=seed0 + 1000 * it,
+                behavior_policy=behavior_policy,
+                base_policy_for_rollout=base_for_rollout,
+                candidate_actions=candidate_actions,
+                info=info,
+            )
+            if X.shape[0] > 0:
+                self.regressor.fit(X, y)  # type: ignore[union-attr]
+                self.is_fitted = True
+
+            behavior_policy = self
+            base_for_rollout = self
+
+        return self
+
+
 __all__ = [
     "OrderUpToBlackboxPFA",
     "OrderUpToRegimeTablePFA",
     "OrderUpToStateDependentPFA",
+    "DirectActionPFA",
     # Notebook-compatible aliases (lecture_11_b naming)
     "OrderUpTo_blackbox_PFA",
     "OrderUpTo_regime_table_PFA",
