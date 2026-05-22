@@ -641,6 +641,7 @@ class DPSolverMultiRegimeScenarios:
         K: int = 15,
         q_lo: float = 1e-4,
         q_hi: float = 1.0 - 1e-4,
+        k: float = 0.0,
     ):
         # Import here to avoid a hard dependency at module import time.
         from inventory.problems.demand_models import PoissonMultiRegimeDemand
@@ -654,6 +655,7 @@ class DPSolverMultiRegimeScenarios:
         self.x_max = int(x_max)
         self.dx = int(dx)
         self.p, self.c, self.h, self.b = float(p), float(c), float(h), float(b)
+        self.k = float(k)
         self.gamma = float(gamma)
         self.terminal_cost_per_unit = float(terminal_cost_per_unit)
 
@@ -699,7 +701,7 @@ class DPSolverMultiRegimeScenarios:
             f"x_max={self.x_max}, dx={self.dx}, p={self.p}, c={self.c}, "
             f"h={self.h}, b={self.b}, terminal_cost_per_unit={self.terminal_cost_per_unit}, "
             f"gamma={self.gamma}, K={self.K}, q_lo={self.q_lo}, q_hi={self.q_hi}, "
-            f"season_period={self.season_period}, R={self.R})"
+            f"k={self.k}, season_period={self.season_period}, R={self.R})"
         )
 
     def _season_updates_at_next_step(self, t: int) -> bool:
@@ -802,7 +804,7 @@ class DPSolverMultiRegimeScenarios:
                     inv_end = np.clip(inv_end, 0, S_max)
                     lost = np.maximum(d_row - oh, 0.0).astype(float)
 
-                    immediate = (self.c * float(x)) + (self.h * inv_end.astype(float)) + (self.b * lost) - (self.p * sales)
+                    immediate = (self.c * float(x)) + (self.k if x > 0 else 0.0) + (self.h * inv_end.astype(float)) + (self.b * lost) - (self.p * sales)
                     cont = self.gamma * Vbar[inv_end]
                     exp = np.sum((immediate + cont) * w_row, axis=1)
 
@@ -815,6 +817,228 @@ class DPSolverMultiRegimeScenarios:
                 x_star[t, :, r] = best_x
 
         return DPSolutionRegime(V=V, x_star=x_star)
+
+    def to_policy(self, sol: DPSolutionRegime) -> DynamicProgrammingPolicyMultiRegime:
+        return DynamicProgrammingPolicyMultiRegime(
+            sol.x_star,
+            S_max=self.S_max,
+            Ks=self.Ks,
+            Kd=self.Kd,
+            Kw=self.Kw,
+            dx=self.dx,
+            x_max=self.x_max,
+            season_index=self.season_index,
+            day_index=self.day_index,
+            weather_index=self.weather_index,
+        )
+
+
+class DPSolverMultiRegimeExact:
+    """Exact DP for the multi-regime inventory problem when T < season_period.
+
+    Exploits two structural simplifications that hold for the default teaching
+    problem (T=30, season_period=90):
+
+    1. **Season is frozen**: because `(t+1) % season_period != 0` for all
+       `t < T`, the season regime never transitions.  It becomes a fixed scalar
+       parameter, not a DP state variable.
+
+    2. **Day is deterministic**: `P_day` is a cyclic shift, so the day at step
+       `t` is fully determined by `(initial_day + t) % Kd`.  No stochastic
+       state needed.
+
+    The effective DP state is therefore just (inventory, weather), giving a
+    table of shape (S_max+1, Kw) instead of (S_max+1, Ks*Kd*Kw).
+
+    The Bellman expectation uses the **full truncated Poisson PMF** (no
+    scenario sampling), so the solution is exact up to the PMF truncation
+    at D_max.
+
+    D_max is chosen automatically via ``auto_D_max_from_lam`` (lam_max + 6*sqrt
+    (lam_max) + 10), which avoids the floating-point underflow that breaks
+    ``poisson_ppf`` for large lambda values (>~200).
+
+    Limitation: if T >= season_period the season can transition and the season
+    dimension must re-enter the state.  The solver raises ValueError in that
+    case rather than silently giving a wrong answer.
+    """
+
+    def __init__(
+        self,
+        exo_multi,
+        *,
+        T: int,
+        S_max: int,
+        x_max: int,
+        dx: int,
+        p: float,
+        c: float,
+        h: float,
+        b: float,
+        terminal_cost_per_unit: float = 0.0,
+        gamma: float = 1.0,
+        initial_season: int = 0,
+        initial_day: int = 0,
+        D_max: Optional[int] = None,
+        k: float = 0.0,
+    ):
+        from inventory.problems.demand_models import PoissonMultiRegimeDemand
+
+        if not isinstance(exo_multi, PoissonMultiRegimeDemand):
+            raise ValueError(
+                "exo_multi must be a PoissonMultiRegimeDemand / ExogenousPoissonMultiRegime instance"
+            )
+
+        self.exo = exo_multi
+        self.T = int(T)
+        self.S_max = int(S_max)
+        self.x_max = int(x_max)
+        self.dx = int(dx)
+        self.p, self.c, self.h, self.b = float(p), float(c), float(h), float(b)
+        self.k = float(k)
+        self.gamma = float(gamma)
+        self.terminal_cost_per_unit = float(terminal_cost_per_unit)
+        self.initial_season = int(initial_season)
+        self.initial_day = int(initial_day)
+
+        self.P_weather = np.asarray(self.exo.P_weather, dtype=float)
+        self.Kw = int(self.P_weather.shape[0])
+        self.Kd = int(self.exo.P_day.shape[0])
+        self.Ks = int(self.exo.P_season.shape[0])
+
+        self.season_period = int(getattr(self.exo, "season_period", 0))
+        self.season_index = int(getattr(self.exo, "season_index", 1))
+        self.day_index = int(getattr(self.exo, "day_index", 2))
+        self.weather_index = int(getattr(self.exo, "weather_index", 3))
+
+        if self.season_period > 0 and self.T >= self.season_period:
+            raise ValueError(
+                f"T={self.T} >= season_period={self.season_period}: the season can transition "
+                "during the horizon.  DPSolverMultiRegimeExact is only valid when T < season_period. "
+                "Use DPSolverMultiRegimeScenarios for the general case."
+            )
+
+        self.inv = np.arange(self.S_max + 1, dtype=int)
+        self.actions = np.arange(0, self.x_max + 1, self.dx, dtype=int)
+
+        # D_max: use the heuristic auto_D_max_from_lam(lam_max, z=6) rather than
+        # poisson_ppf, which suffers from float underflow when lam > ~200.
+        lam_max = max(
+            self.exo.lambda_for_regimes(self.initial_season, d, w)
+            for d in range(self.Kd)
+            for w in range(self.Kw)
+        )
+        self._D_max = int(D_max) if D_max is not None else auto_D_max_from_lam(lam_max)
+
+    def __repr__(self) -> str:
+        return (
+            f"DPSolverMultiRegimeExact("
+            f"T={self.T}, S_max={self.S_max}, x_max={self.x_max}, dx={self.dx}, "
+            f"p={self.p}, c={self.c}, h={self.h}, b={self.b}, "
+            f"gamma={self.gamma}, initial_season={self.initial_season}, "
+            f"initial_day={self.initial_day}, D_max={self._D_max}, Kw={self.Kw})"
+        )
+
+    def _day_at_step(self, t: int) -> int:
+        """Deterministic day index at step t (cyclic shift from initial_day)."""
+        return int((self.initial_day + t) % self.Kd)
+
+    def solve(self) -> DPSolutionRegime:
+        """Backward induction over (inventory, weather) state space.
+
+        The Bellman update for state (inv, w) and action x is:
+
+            Q(inv, w, x) = sum_{wp1} P_weather[w, wp1]
+                           * sum_d pmf_{wp1}[d] * (cost(inv, x, d) + gamma * V_next[wp1, inv_end])
+
+        where pmf_{wp1} is the exact Poisson PMF for the next-period demand
+        rate determined by (season, day_{t+1}, wp1).
+
+        The inner sum over d is vectorised over all inventory states at once
+        using numpy fancy indexing (shape S x D), so the only Python loops are
+        over t (30), x (49), and wp1 (3) — 30 * 49 * 3 = 4,410 iterations.
+
+        Returns a DPSolutionRegime with x_star of shape (T, S_max+1, R) where
+        R = Ks * Kd * Kw.  States that are unreachable given the frozen season
+        and deterministic day carry x_star = 0 (harmless default).
+        """
+
+        T, S_max, Kw = self.T, self.S_max, self.Kw
+        D_max = self._D_max
+        R = self.Ks * self.Kd * self.Kw
+
+        # V_next[w, inv] — compact value table, shape (Kw, S_max+1)
+        V_next = np.zeros((Kw, S_max + 1), dtype=float)
+        if self.terminal_cost_per_unit != 0.0:
+            V_next[:, :] = self.terminal_cost_per_unit * self.inv.astype(float)[None, :]
+
+        x_star_full = np.zeros((T, S_max + 1, R), dtype=int)
+
+        inv = self.inv                              # (S,)
+        d_range = np.arange(D_max + 1, dtype=int)  # (D,)
+
+        for t in reversed(range(T)):
+            d_next = self._day_at_step(t + 1)
+            V_cur = np.full((Kw, S_max + 1), np.inf, dtype=float)
+            x_cur = np.zeros((Kw, S_max + 1), dtype=int)
+
+            pmfs = np.empty((Kw, D_max + 1), dtype=float)
+            for wp1 in range(Kw):
+                lam = self.exo.lambda_for_regimes(self.initial_season, d_next, wp1)
+                pmf, tail = poisson_pmf_truncated(lam, D_max)
+                pmf[-1] += tail
+                pmfs[wp1] = pmf
+
+            # Precompute marginal pmf per current weather:
+            # pmf_marg[w, d] = sum_{wp1} P[w, wp1] * pmfs[wp1, d]
+            pmf_marg = self.P_weather @ pmfs  # (Kw, D)
+
+            for x in self.actions:
+                on_hand = np.minimum(inv + x, S_max)
+                inv_end = np.clip(on_hand[:, None] - d_range[None, :], 0, S_max)  # (S,D)
+                lost = np.maximum(d_range[None, :] - on_hand[:, None], 0.0)
+                sales = d_range[None, :].astype(float) - lost
+
+                immediate = (
+                    self.c * float(x)
+                    + (self.k if x > 0 else 0.0)
+                    + self.h * inv_end.astype(float)
+                    + self.b * lost
+                    - self.p * sales
+                )  # (S, D)
+
+                feasible = x <= (S_max - inv)  # (S,)
+
+                # Expected immediate cost per current weather w:
+                # E_imm[w, s] = sum_d pmf_marg[w,d] * immediate[s,d]
+                E_imm = immediate @ pmf_marg.T  # (S, Kw)  ->  transposed below
+
+                # Continuation: for each wp1, sum_d pmfs[wp1,d] * V_next[wp1, inv_end[s,d]]
+                # = (V_next[wp1][inv_end] * pmfs[wp1]).sum(axis=1)   shape (S,)
+                # Then E_cont[w,s] = sum_{wp1} P[w,wp1] * cont_wp1[s]
+                cont_by_wp1 = np.empty((Kw, S_max + 1), dtype=float)
+                for wp1 in range(Kw):
+                    cont_by_wp1[wp1] = np.sum(
+                        V_next[wp1][inv_end] * pmfs[wp1][None, :], axis=1
+                    )
+                E_cont = self.P_weather @ cont_by_wp1  # (Kw, S)
+
+                for w in range(Kw):
+                    Q_w = E_imm[:, w] + self.gamma * E_cont[w]  # (S,)
+                    improve = feasible & (Q_w < V_cur[w])
+                    V_cur[w] = np.where(improve, Q_w, V_cur[w])
+                    x_cur[w] = np.where(improve, x, x_cur[w])
+
+            # Map (w,) back to full regime index for this (season, day_t) pair
+            d_this = self._day_at_step(t)
+            r_this = int((self.initial_season * self.Kd + d_this) * self.Kw)
+            for w in range(Kw):
+                x_star_full[t, :, r_this + w] = x_cur[w]
+
+            V_next = V_cur
+
+        V_out = np.zeros((T + 1, S_max + 1, R), dtype=float)
+        return DPSolutionRegime(V=V_out, x_star=x_star_full)
 
     def to_policy(self, sol: DPSolutionRegime) -> DynamicProgrammingPolicyMultiRegime:
         return DynamicProgrammingPolicyMultiRegime(
@@ -848,4 +1072,5 @@ __all__ = [
     # Multi-regime DP (season/day/weather) with time-dependent season transitions
     "DynamicProgrammingPolicyMultiRegime",
     "DPSolverMultiRegimeScenarios",
+    "DPSolverMultiRegimeExact",
 ]
