@@ -43,6 +43,9 @@ class OrderMilpCfaPolicy(Policy):
     b: float = 1.0
     K: float = 0.0
 
+    # service level: if set, l_k <= (1-alpha)*mu_k  (deterministic fill-rate constraint)
+    alpha: Optional[float] = None
+
     def __post_init__(self) -> None:
         self.H = int(self.H)
         if not (1 <= self.H <= 5):
@@ -61,6 +64,11 @@ class OrderMilpCfaPolicy(Policy):
         self.b = float(self.b)
         self.K = float(self.K)
 
+        if self.alpha is not None:
+            if not (0.0 <= self.alpha <= 1.0):
+                raise ValueError("alpha must be in [0, 1]")
+            self.alpha = float(self.alpha)
+
         self._q_max = int(np.floor(self.x_max / max(1, self.dx)))
 
     def __repr__(self) -> str:
@@ -69,7 +77,7 @@ class OrderMilpCfaPolicy(Policy):
             "OrderMilpCfaPolicy("
             f"H={self.H}, x_max={self.x_max}, dx={self.dx}, "
             f"S_max={self.S_max}, p={self.p}, c={self.c}, h={self.h}, "
-            f"b={self.b}, K={self.K}, forecaster={forecaster_name!r})"
+            f"b={self.b}, K={self.K}, alpha={self.alpha}, forecaster={forecaster_name!r})"
         )
 
     def _fallback_order(self, inv0: float, mu0: float) -> float:
@@ -99,9 +107,9 @@ class OrderMilpCfaPolicy(Policy):
         return np.maximum(mu, 0.0)
 
     def act(self, state: State, t: int, info: Optional[dict] = None) -> Action:
-        inv0 = float(state[0])
+        inv0 = float(state[0])   # I_t: observed inventory at current epoch
         H = int(self.H)
-        mu = self._forecast_mean_path(state, int(t), H, info)
+        mu = self._forecast_mean_path(state, int(t), H, info)  # mu[k] = hat_mu_k
 
         try:
             from scipy.optimize import Bounds, LinearConstraint, milp
@@ -109,39 +117,76 @@ class OrderMilpCfaPolicy(Policy):
             x0 = self._fallback_order(inv0, float(mu[0]) if len(mu) else 0.0)
             return np.array([x0], dtype=float)
 
+        # -----------------------------------------------------------------------
+        # scipy.optimize.milp solves:
+        #   min   cvec @ z
+        #   s.t.  lb_con <= A @ z <= ub_con   (LinearConstraint)
+        #         lb     <= z     <= ub        (Bounds)
+        #         z[i] integer  if integrality[i] == 1
+        #
+        # All MILP variables are packed into a single flat vector z of length n.
+        # The index functions below give the position of each mathematical
+        # variable inside z:
+        #
+        #   z = [ q_0, y_0, s_0, l_0,   <- step k=0  (4 variables)
+        #         q_1, y_1, s_1, l_1,   <- step k=1
+        #         ...
+        #         q_{H-1}, y_{H-1}, s_{H-1}, l_{H-1},   <- step k=H-1
+        #         I_0, I_1, ..., I_H ]  <- inventory states (H+1 variables)
+        #
+        # Total: 4H + (H+1) = 5H+1 variables.
+        # -----------------------------------------------------------------------
+
         def idx_q(k: int) -> int:
-            return 4 * k + 0
+            return 4 * k + 0   # integer batch count: x_k = dx * q_k
 
         def idx_y(k: int) -> int:
-            return 4 * k + 1
+            return 4 * k + 1   # binary order indicator: y_k = 1[q_k > 0]
 
         def idx_s(k: int) -> int:
-            return 4 * k + 2
+            return 4 * k + 2   # continuous sales: s_k
 
         def idx_l(k: int) -> int:
-            return 4 * k + 3
+            return 4 * k + 3   # continuous lost sales: l_k
 
         def idx_I(k: int) -> int:
-            return 4 * H + k  # k=0..H
+            return 4 * H + k   # inventory: I_k, for k = 0..H
 
-        n = 5 * H + 1
+        n = 5 * H + 1          # total number of decision variables
 
-        # objective (minimize)
+        # -----------------------------------------------------------------------
+        # Objective vector cvec (one coefficient per variable in z):
+        #   min  sum_k [ c*dx*q_k  +  K*y_k  +  h*I_{k+1}  +  b*l_k  -  p*s_k ]
+        #
+        # cvec[i] is the cost multiplier for z[i]; 0 for variables not in objective.
+        # -----------------------------------------------------------------------
         cvec = np.zeros(n, dtype=float)
         for k in range(H):
-            cvec[idx_q(k)] = self.c * float(self.dx)
-            cvec[idx_y(k)] = self.K
-            cvec[idx_s(k)] = -self.p
-            cvec[idx_l(k)] = self.b
-            cvec[idx_I(k + 1)] = self.h
+            cvec[idx_q(k)] = self.c * float(self.dx)  # purchase cost: c * x_k = c*dx*q_k
+            cvec[idx_y(k)] = self.K                    # fixed setup cost: K * y_k
+            cvec[idx_s(k)] = -self.p                   # revenue (negative cost): -p * s_k
+            cvec[idx_l(k)] = self.b                    # stockout penalty: b * l_k
+            cvec[idx_I(k + 1)] = self.h                # holding cost: h * I_{k+1}
 
-        # integrality for q and y
+        # -----------------------------------------------------------------------
+        # Integrality: 1 = integer variable, 0 = continuous.
+        # q_k must be integer (batch count); y_k is binary (bounds enforce {0,1}).
+        # s_k, l_k, I_k are continuous.
+        # -----------------------------------------------------------------------
         integrality = np.zeros(n, dtype=int)
         for k in range(H):
-            integrality[idx_q(k)] = 1
-            integrality[idx_y(k)] = 1
+            integrality[idx_q(k)] = 1   # q_k in Z_+
+            integrality[idx_y(k)] = 1   # y_k in {0, 1}  (bounds below set ub=1)
 
-        # bounds
+        # -----------------------------------------------------------------------
+        # Variable bounds (lb <= z <= ub):
+        #   q_k in [0, q_max]
+        #   y_k in [0, 1]        <- combined with integrality: y_k in {0,1}
+        #   s_k in [0, mu_k]     <- cannot sell more than forecast demand
+        #   l_k in [0, (1-alpha)*mu_k]  <- service level cap if alpha is set
+        #   I_k >= 0             <- non-negative inventory
+        #   I_0 = inv0           <- fix initial condition (lb = ub = inv0)
+        # -----------------------------------------------------------------------
         lb = np.zeros(n, dtype=float)
         ub = np.full(n, np.inf, dtype=float)
         for k in range(H):
@@ -155,41 +200,52 @@ class OrderMilpCfaPolicy(Policy):
             ub[idx_s(k)] = float(mu[k])
 
             lb[idx_l(k)] = 0.0
-            ub[idx_l(k)] = float(mu[k])
+            ub[idx_l(k)] = float(mu[k]) if self.alpha is None else (1.0 - self.alpha) * float(mu[k])
 
         for k in range(H + 1):
             lb[idx_I(k)] = 0.0
 
+        # Fix I_0 = inv0 by setting lb = ub = inv0 (forces z[idx_I(0)] = inv0)
         lb[idx_I(0)] = inv0
         ub[idx_I(0)] = inv0
 
         bounds = Bounds(lb=lb, ub=ub)
 
+        # -----------------------------------------------------------------------
+        # Linear constraints:  lb_con <= A @ z <= ub_con
+        #
+        # Each constraint is one row of A.  We build A row-by-row and stack at end.
+        # Equality  f(z) = rhs  <=>  lb_con = ub_con = rhs
+        # Inequality f(z) <= rhs <=>  lb_con = -inf,  ub_con = rhs
+        # -----------------------------------------------------------------------
         A_rows: list[np.ndarray] = []
         lb_con: list[float] = []
         ub_con: list[float] = []
 
-        # (C1) s_k <= I_k + dx*q_k
+        # (C1) Sales limited by available inventory:  s_k <= I_k + dx*q_k
+        #      Rearranged for A @ z form:  s_k - I_k - dx*q_k <= 0
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_s(k)] = 1.0
             row[idx_I(k)] = -1.0
             row[idx_q(k)] = -float(self.dx)
             A_rows.append(row)
-            lb_con.append(-np.inf)
+            lb_con.append(-np.inf)   # one-sided inequality
             ub_con.append(0.0)
 
-        # (C2) s_k + l_k = mu_k
+        # (C2) Demand split:  s_k + l_k = mu_k  (equality)
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_s(k)] = 1.0
             row[idx_l(k)] = 1.0
             rhs = float(mu[k])
             A_rows.append(row)
-            lb_con.append(rhs)
+            lb_con.append(rhs)   # lb = ub = rhs encodes equality
             ub_con.append(rhs)
 
-        # (C3) I_{k+1} = I_k + dx*q_k - s_k
+        # (C3) Inventory balance (transition equation):
+        #      I_{k+1} = I_k + dx*q_k - s_k
+        #      Rearranged: I_{k+1} - I_k - dx*q_k + s_k = 0
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_I(k + 1)] = 1.0
@@ -197,26 +253,29 @@ class OrderMilpCfaPolicy(Policy):
             row[idx_q(k)] = -float(self.dx)
             row[idx_s(k)] = 1.0
             A_rows.append(row)
-            lb_con.append(0.0)
+            lb_con.append(0.0)   # equality: = 0
             ub_con.append(0.0)
 
-        # (C4) link q and y
+        # (C4) Setup cost indicator linking:
+        #      y_k = 1 iff q_k > 0  (forces setup cost K when ordering)
+        #      (C4a) q_k <= q_max * y_k   ->  q_k - q_max*y_k <= 0
+        #      (C4b) y_k <= q_k           ->  y_k - q_k <= 0
         for k in range(H):
-            row = np.zeros(n, dtype=float)
+            row = np.zeros(n, dtype=float)          # (C4a)
             row[idx_q(k)] = 1.0
             row[idx_y(k)] = -float(self._q_max)
             A_rows.append(row)
             lb_con.append(-np.inf)
             ub_con.append(0.0)
 
-            row = np.zeros(n, dtype=float)
+            row = np.zeros(n, dtype=float)          # (C4b)
             row[idx_y(k)] = 1.0
             row[idx_q(k)] = -1.0
             A_rows.append(row)
             lb_con.append(-np.inf)
             ub_con.append(0.0)
 
-        # (C5) optional capacity cap: I_k + dx*q_k <= S_max
+        # (C5) Optional warehouse capacity:  I_k + dx*q_k <= S_max  (pre-demand cap)
         if self.S_max is not None:
             for k in range(H):
                 row = np.zeros(n, dtype=float)
@@ -226,6 +285,7 @@ class OrderMilpCfaPolicy(Policy):
                 lb_con.append(-np.inf)
                 ub_con.append(float(self.S_max))
 
+        # Stack all constraint rows into matrix A, then call milp
         A = np.vstack(A_rows) if A_rows else np.zeros((0, n), dtype=float)
         constraints = LinearConstraint(A, np.array(lb_con, dtype=float), np.array(ub_con, dtype=float))
 
@@ -234,11 +294,13 @@ class OrderMilpCfaPolicy(Policy):
             x0 = self._fallback_order(inv0, float(mu[0]) if len(mu) else 0.0)
             return np.array([x0], dtype=float)
 
+        # Rolling horizon: extract ONLY the first decision q_0* and discard the rest.
+        # The plan for k=1..H-1 improves q_0* via look-ahead but is never executed.
         q0 = float(res.x[idx_q(0)])
-        x0 = float(self.dx) * float(int(np.round(q0)))
+        x0 = float(self.dx) * float(int(np.round(q0)))   # x_0 = dx * q_0*
         x0 = min(x0, self.x_max)
         if self.S_max is not None:
-            x0 = min(x0, max(0.0, self.S_max - inv0))
+            x0 = min(x0, max(0.0, self.S_max - inv0))    # respect physical warehouse cap
         x0 = float(int(np.round(max(0.0, x0))))
         return np.array([x0], dtype=float)
 
