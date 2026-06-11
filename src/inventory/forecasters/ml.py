@@ -50,6 +50,85 @@ class ConstantFeatureAdapter:
 
 
 @dataclass(frozen=True)
+class ConstantAr1FeatureAdapter:
+    """Constant-demand adapter with one autoregressive demand lag.
+
+    Feature layout per step:
+      φ_k = [1, last_demand_k / lag_scale]
+
+    This is the constant-demand analogue of ``MultiRegimeAr1FeatureAdapter``.
+    It preserves the same rollout contract expected by ``MlAr1RegimeDemandForecaster``
+    while replacing the regime block with a single constant intercept term.
+    """
+
+    exog: PoissonConstantDemand
+    default_last_demand: Optional[float] = None
+    lag_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if float(self.lag_scale) <= 0.0:
+            raise ValueError("lag_scale must be positive")
+
+    def _default_last_demand_from_state(self, state: State) -> float:
+        _ = state
+        if self.default_last_demand is not None:
+            return float(max(0.0, self.default_last_demand))
+        return float(max(0.0, getattr(self.exog, "lam", 0.0)))
+
+    def extract_last_demand(self, state: State, info: Optional[dict]) -> float:
+        if info and "demand_history" in info:
+            values = np.asarray(info["demand_history"], dtype=float).reshape(-1)
+            values = values[np.isfinite(values)]
+            if values.size >= 1:
+                return float(max(0.0, values[-1]))
+
+        if info and "last_demand" in info:
+            value = np.asarray(info["last_demand"], dtype=float).reshape(-1)
+            value = value[np.isfinite(value)]
+            if value.size >= 1:
+                return float(max(0.0, value[-1]))
+
+        return self._default_last_demand_from_state(state)
+
+    def regime_features(self, state: State, t: int) -> np.ndarray:
+        _ = state, int(t)
+        return np.array([1.0], dtype=float)
+
+    def regime_features_path(self, state: State, t: int, H: int) -> np.ndarray:
+        _ = state, int(t)
+        H = int(H)
+        if H <= 0:
+            return np.zeros((0, 1), dtype=float)
+        return np.ones((H, 1), dtype=float)
+
+    def one_step_features(self, state: State, t: int, last_demand: float) -> np.ndarray:
+        _ = state, int(t)
+        return np.array([1.0, float(max(0.0, last_demand)) / float(self.lag_scale)], dtype=float)
+
+    def generate_dataset(self, n_samples: int, seed: int, t_start: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        _ = int(t_start)
+        rng = np.random.default_rng(int(seed))
+        n_samples = int(n_samples)
+
+        X = np.empty((n_samples, 2), dtype=float)
+        y = np.empty(n_samples, dtype=float)
+
+        if self.default_last_demand is None:
+            last_demand = float(rng.poisson(float(max(0.0, getattr(self.exog, "lam", 0.0)))))
+        else:
+            last_demand = float(max(0.0, self.default_last_demand))
+
+        for i in range(n_samples):
+            X[i, 0] = 1.0
+            X[i, 1] = float(max(0.0, last_demand)) / float(self.lag_scale)
+
+            y[i] = float(rng.poisson(float(max(0.0, getattr(self.exog, "lam", 0.0)))))
+            last_demand = float(y[i])
+
+        return X, y
+
+
+@dataclass(frozen=True)
 class SeasonalFeatureAdapter:
     """Adapter for seasonal demand models.
 
@@ -437,9 +516,18 @@ class MultiRegimeAr1FeatureAdapter:
         return float(self.exog.lambda_for_regimes(r_season, r_day, r_weather))
 
     def extract_last_demand(self, state: State, info: Optional[dict]) -> float:
+        # Prefer bounded demand history from simulation when available,
+        # then fall back to the one-step `last_demand` payload.
+        if info and "demand_history" in info:
+            values = np.asarray(info["demand_history"], dtype=float).reshape(-1)
+            values = values[np.isfinite(values)]
+            if values.size >= 1:
+                return float(max(0.0, values[-1]))
+
         if info and "last_demand" in info:
             value = np.asarray(info["last_demand"], dtype=float).reshape(-1)
-            if value.size >= 1 and np.isfinite(value[-1]):
+            value = value[np.isfinite(value)]
+            if value.size >= 1:
                 return float(max(0.0, value[-1]))
         return self._default_last_demand_from_state(state)
 
@@ -552,6 +640,9 @@ def _build_ml_backend(
     n_estimators: int = 150,
     learning_rate: float = 0.05,
     max_depth: int = 3,
+    tree_max_depth: int = 6,
+    alpha: float = 1e-3,
+    l1_ratio: float = 0.5,
 ) -> tuple[str, object]:
     model_type = str(model_type).lower()
 
@@ -559,7 +650,7 @@ def _build_ml_backend(
         try:
             from sklearn.tree import DecisionTreeRegressor
 
-            return model_type, DecisionTreeRegressor(max_depth=6, random_state=int(random_state))
+            return model_type, DecisionTreeRegressor(max_depth=int(tree_max_depth), random_state=int(random_state))
         except Exception:
             model_type = "linear"
 
@@ -580,7 +671,7 @@ def _build_ml_backend(
         try:
             from sklearn.linear_model import ElasticNet
 
-            return model_type, ElasticNet(alpha=1e-3, l1_ratio=0.5, max_iter=5000, random_state=int(random_state))
+            return model_type, ElasticNet(alpha=float(alpha), l1_ratio=float(l1_ratio), max_iter=5000, random_state=int(random_state))
         except Exception:
             model_type = "linear"
 
@@ -878,15 +969,21 @@ class QuantileBoostingRegimeDemandForecaster(MlRegimeDemandForecaster):
 class MlAr1RegimeDemandForecaster(MlRegimeDemandForecaster):
     """Regime-aware ML forecaster with one autoregressive demand lag."""
 
-    def __init__(self, adapter: MultiRegimeAr1FeatureAdapter, *, model_type: str = "tree", random_state: int = 0):
+    def __init__(
+        self,
+        adapter: MultiRegimeAr1FeatureAdapter | ConstantAr1FeatureAdapter,
+        *,
+        model_type: str = "tree",
+        random_state: int = 0,
+    ):
         super().__init__(adapter, model_type=model_type, random_state=random_state)
 
     @property
-    def adapter(self) -> MultiRegimeAr1FeatureAdapter:  # type: ignore[override]
+    def adapter(self) -> MultiRegimeAr1FeatureAdapter | ConstantAr1FeatureAdapter:  # type: ignore[override]
         return self.__dict__["adapter"]
 
     @adapter.setter
-    def adapter(self, value: MultiRegimeAr1FeatureAdapter) -> None:  # type: ignore[override]
+    def adapter(self, value: MultiRegimeAr1FeatureAdapter | ConstantAr1FeatureAdapter) -> None:  # type: ignore[override]
         self.__dict__["adapter"] = value
 
     def forecast_mean_path(self, state: State, t: int, H: int, info: Optional[dict] = None) -> np.ndarray:
@@ -915,15 +1012,341 @@ class MlAr1RegimeDemandForecaster(MlRegimeDemandForecaster):
         return mu.astype(float)
 
 
+# ---------------------------------------------------------------------------
+# General AR(p) architecture
+# ---------------------------------------------------------------------------
+
+class ArpFeatureAdapterMixin:
+    """Mixin that adds AR(p) lag handling on top of any existing feature adapter.
+
+    Subclasses supply a *base adapter* via ``_base_adapter()`` which must implement:
+    - ``features_path(state, t, H) -> (H, d_base)``  — regime/structural features
+    - ``generate_dataset(n_samples, seed, **kwargs) -> (X, y)``  — base training data
+
+    This mixin then:
+    - appends ``p`` lag columns to every row of features
+    - generates training data by shifting a rolling lag vector forward
+    - at rollout reads ``info["demand_history"]`` (preferred) or ``info["last_demand"]``
+      to seed the initial lag vector
+    - rolls the lag vector recursively using the model's own predictions for k > 0
+    """
+
+    # Subclasses must set these as instance / dataclass attributes:
+    # p: int
+    # lag_scale: float
+    # default_last_demand: Optional[float]
+
+    def _extract_initial_lags(self, state: State, info: Optional[dict]) -> np.ndarray:
+        p = int(self.p)  # type: ignore[attr-defined]
+        lag_scale = float(self.lag_scale)  # type: ignore[attr-defined]
+        default_val = self._default_lag_value(state)
+
+        lags = np.full(p, default_val, dtype=float)
+
+        if info and "demand_history" in info:
+            values = np.asarray(info["demand_history"], dtype=float).reshape(-1)
+            values = values[np.isfinite(values)]
+            values = np.maximum(values, 0.0)
+            if values.size >= 1:
+                tail = values[-p:]
+                lags[-tail.size:] = tail
+                return lags
+
+        if info and "last_demand" in info:
+            values = np.asarray(info["last_demand"], dtype=float).reshape(-1)
+            values = values[np.isfinite(values)]
+            values = np.maximum(values, 0.0)
+            if values.size >= 1:
+                lags[-1] = float(values[-1])
+
+        return lags
+
+    def _default_lag_value(self, state: State) -> float:
+        """Return the scalar fallback used to initialise the lag vector."""
+        ddl = getattr(self, "default_last_demand", None)
+        if ddl is not None:
+            return float(max(0.0, ddl))
+        # Try to get a sensible default from the exog model
+        exog = getattr(self, "exog", None)
+        if exog is not None:
+            if hasattr(exog, "lam"):
+                return float(max(0.0, exog.lam))
+            if hasattr(exog, "lambda_for_regimes"):
+                # multi-regime: use current regime from state
+                try:
+                    base = MultiRegimeFeatureAdapter(exog)
+                    r_s, r_d, r_w = base._regimes_from_state(state)
+                    return float(max(0.0, exog.lambda_for_regimes(r_s, r_d, r_w)))
+                except Exception:
+                    pass
+        return 0.0
+
+    def _append_lags_to_features(self, base_Xh: np.ndarray, lag_init: np.ndarray) -> Tuple[np.ndarray, list]:
+        """Pre-compute the full (H, d_base + p) feature matrix for forecasting.
+
+        Returns (Xh_full, list_of_lag_vectors) so the forecaster can roll forward
+        with its own predictions.  The lag vectors returned are the *input* lags for
+        each step — they have not yet been updated with predictions.
+        """
+        H = base_Xh.shape[0]
+        p = int(self.p)  # type: ignore[attr-defined]
+        lag_scale = float(self.lag_scale)  # type: ignore[attr-defined]
+
+        d = base_Xh.shape[1] + p
+        Xh = np.empty((H, d), dtype=float)
+        lag_vectors: list = []
+
+        lags = lag_init.copy()
+        for k in range(H):
+            Xh[k, : base_Xh.shape[1]] = base_Xh[k]
+            Xh[k, base_Xh.shape[1] :] = lags / lag_scale
+            lag_vectors.append(lags.copy())
+            # placeholder — caller fills in after prediction
+            lags = np.roll(lags, -1)
+
+        return Xh, lag_vectors
+
+    def _generate_arp_dataset(
+        self,
+        base_X: np.ndarray,
+        base_y: np.ndarray,
+        *,
+        init_lag: Optional[float] = None,
+        seed: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Augment base training data with rolling AR(p) lag columns."""
+        p = int(self.p)  # type: ignore[attr-defined]
+        lag_scale = float(self.lag_scale)  # type: ignore[attr-defined]
+        n = base_X.shape[0]
+        rng = np.random.default_rng(int(seed))
+
+        if init_lag is None:
+            default = self._default_lag_value(np.zeros(1))
+            init_lag = float(rng.poisson(max(1, default)) if default > 0 else 0.0)
+
+        lag_vector = np.full(p, float(init_lag), dtype=float)
+        X_aug = np.empty((n, base_X.shape[1] + p), dtype=float)
+
+        for i in range(n):
+            X_aug[i, : base_X.shape[1]] = base_X[i]
+            X_aug[i, base_X.shape[1] :] = lag_vector / lag_scale
+            lag_vector = np.roll(lag_vector, -1)
+            lag_vector[-1] = float(base_y[i])
+
+        return X_aug, base_y
+
+
+@dataclass(frozen=True)
+class ConstantArpFeatureAdapter(ArpFeatureAdapterMixin):
+    """Constant-demand AR(p) adapter.
+
+    Feature layout per step:
+      φ_k = [1, D_{t-p}/lag_scale, …, D_{t-1}/lag_scale]
+
+    Works with ``MlArpDemandForecaster``.
+    Compatible with ``PoissonConstantDemand``.
+    """
+
+    exog: PoissonConstantDemand
+    p: int = 7
+    default_last_demand: Optional[float] = None
+    lag_scale: float = 100.0
+
+    def __post_init__(self) -> None:
+        if int(self.p) <= 0:
+            raise ValueError("p must be positive")
+        if float(self.lag_scale) <= 0.0:
+            raise ValueError("lag_scale must be positive")
+
+    def _base_adapter(self) -> ConstantFeatureAdapter:
+        return ConstantFeatureAdapter(self.exog)
+
+    def features_path(self, state: State, t: int, H: int) -> np.ndarray:
+        base_Xh = self._base_adapter().features_path(int(t), H)
+        Xh, _ = self._append_lags_to_features(base_Xh, self._extract_initial_lags(state, None))
+        return Xh
+
+    def generate_dataset(self, n_samples: int, seed: int, t_start: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        base_X, base_y = self._base_adapter().generate_dataset(n_samples=n_samples, seed=seed, t_start=t_start)
+        return self._generate_arp_dataset(base_X, base_y, seed=seed)
+
+
+@dataclass(frozen=True)
+class MultiRegimeArpFeatureAdapter(ArpFeatureAdapterMixin):
+    """Multi-regime AR(p) adapter.
+
+    Feature layout per step:
+      φ_k = [1, pi_season_k…, pi_day_k…, pi_weather_k…, D_{t-p}/lag_scale, …, D_{t-1}/lag_scale]
+
+    Works with ``MlArpDemandForecaster``.
+    Compatible with ``PoissonMultiRegimeDemand`` / ``ExogenousPoissonMultiRegime``.
+    """
+
+    exog: PoissonMultiRegimeDemand
+    p: int = 3
+    default_last_demand: Optional[float] = None
+    lag_scale: float = 100.0
+
+    def __post_init__(self) -> None:
+        if int(self.p) <= 0:
+            raise ValueError("p must be positive")
+        if float(self.lag_scale) <= 0.0:
+            raise ValueError("lag_scale must be positive")
+
+    def _base_adapter(self) -> MultiRegimeFeatureAdapter:
+        return MultiRegimeFeatureAdapter(self.exog)
+
+    def features_path(self, state: State, t: int, H: int) -> np.ndarray:
+        base_Xh = self._base_adapter().features_path(state, int(t), H)
+        Xh, _ = self._append_lags_to_features(base_Xh, self._extract_initial_lags(state, None))
+        return Xh
+
+    def generate_dataset(
+        self,
+        n_samples: int,
+        seed: int,
+        t_start: int = 0,
+        *,
+        season0: int | None = None,
+        day0: int | None = None,
+        weather0: int | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        base_X, base_y = self._base_adapter().generate_dataset(
+            n_samples=n_samples, seed=seed, t_start=t_start,
+            season0=season0, day0=day0, weather0=weather0,
+        )
+        return self._generate_arp_dataset(base_X, base_y, seed=seed)
+
+
+class MlArpDemandForecaster(DemandForecaster):
+    """ML forecaster for AR(p) feature adapters.
+
+    Works with both :class:`ConstantArpFeatureAdapter` and
+    :class:`MultiRegimeArpFeatureAdapter` — any adapter that:
+
+    - implements ``generate_dataset(n_samples, seed, ...)``
+    - implements ``features_path(state, t, H)`` (used for state-only forecasts)
+    - inherits :class:`ArpFeatureAdapterMixin` for lag extraction / rolling
+
+    At decision time the lag vector is seeded from ``info["demand_history"]``
+    (preferred) or ``info["last_demand"]``, then rolled forward recursively
+    using the model's own predictions for steps k > 0.
+    """
+
+    def __init__(
+        self,
+        adapter: ConstantArpFeatureAdapter | MultiRegimeArpFeatureAdapter,
+        *,
+        model_type: str = "tree",
+        random_state: int = 0,
+        tree_max_depth: int = 6,
+        alpha: float = 1e-3,
+        l1_ratio: float = 0.5,
+    ):
+        self.adapter = adapter
+        self.model_type = str(model_type).lower()
+        self.random_state = int(random_state)
+        self.tree_max_depth = int(tree_max_depth)
+        self.alpha = float(alpha)
+        self.l1_ratio = float(l1_ratio)
+        self.model = None
+        self._trained = False
+        self.fit_report: dict = {}
+        self.model_type, self.model = _build_ml_backend(
+            self.model_type,
+            random_state=self.random_state,
+            tree_max_depth=self.tree_max_depth,
+            alpha=self.alpha,
+            l1_ratio=self.l1_ratio,
+        )
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        _fit_ml_backend(self.model_type, self.model, X, y)
+        self._trained = True
+        return self
+
+    def _predict(self, X: np.ndarray) -> np.ndarray:
+        return _predict_ml_backend(self.model_type, self.model, X)
+
+    def evaluate(self, X: np.ndarray, y: np.ndarray) -> dict:
+        yhat = np.maximum(self._predict(X), 0.0)
+        return regression_metrics(y, yhat)
+
+    def fit_from_exogenous(
+        self,
+        *,
+        n_samples: int = 6000,
+        seed: int = 7,
+        t_start: int = 0,
+        val_samples: int = 1000,
+        val_seed: int = 99,
+        val_t_start: int = 8000,
+        **kwargs,
+    ):
+        X_train, y_train = self.adapter.generate_dataset(n_samples=n_samples, seed=seed, t_start=t_start, **kwargs)
+        self.fit(X_train, y_train)
+
+        train_metrics = self.evaluate(X_train, y_train)
+        X_val, y_val = self.adapter.generate_dataset(n_samples=val_samples, seed=val_seed, t_start=val_t_start, **kwargs)
+        val_metrics = self.evaluate(X_val, y_val)
+
+        self.fit_report = {
+            "model_type": self.model_type,
+            "random_state": self.random_state,
+            "tree_max_depth": self.tree_max_depth,
+            "alpha": self.alpha,
+            "l1_ratio": self.l1_ratio,
+            "feature_dim": int(X_train.shape[1]),
+            "p": int(self.adapter.p),
+            "train": {"n_samples": int(n_samples), "seed": int(seed), "t_start": int(t_start), **train_metrics},
+            "val": {"n_samples": int(val_samples), "seed": int(val_seed), "t_start": int(val_t_start), **val_metrics},
+        }
+        return self
+
+    def forecast_mean_path(self, state: State, t: int, H: int, info: Optional[dict] = None) -> np.ndarray:
+        if not self._trained:
+            raise RuntimeError("MlArpDemandForecaster must be trained first.")
+
+        H = int(H)
+        if H <= 0:
+            return np.zeros(0, dtype=float)
+
+        # Seed lag vector from info; subsequent steps use model predictions
+        lag_vector = self.adapter._extract_initial_lags(state, info)
+        lag_scale = float(self.adapter.lag_scale)
+
+        # Get regime/structural features for the full horizon
+        base_Xh = self.adapter._base_adapter().features_path(state, int(t), H)
+
+        mu = np.empty(H, dtype=float)
+        for k in range(H):
+            xk = np.concatenate([
+                np.asarray(base_Xh[k], dtype=float).reshape(-1),
+                lag_vector / lag_scale,
+            ])
+            mu_k = float(max(0.0, self._predict(xk)[0]))
+            mu[k] = mu_k
+            lag_vector = np.roll(lag_vector, -1)
+            lag_vector[-1] = mu_k
+
+        return mu.astype(float)
+
+
 __all__ = [
     "ConstantFeatureAdapter",
+    "ConstantAr1FeatureAdapter",
+    "ConstantArpFeatureAdapter",
     "SeasonalFeatureAdapter",
     "RegimeFeatureAdapter",
     "MultiRegimeFeatureAdapter",
     "MultiRegimeAr1FeatureAdapter",
+    "MultiRegimeArpFeatureAdapter",
     "MlDemandForecaster",
     "MlRegimeDemandForecaster",
     "QuantileBoostingRegimeDemandForecaster",
     "MlAr1RegimeDemandForecaster",
+    "MlArpDemandForecaster",
     "regression_metrics",
 ]

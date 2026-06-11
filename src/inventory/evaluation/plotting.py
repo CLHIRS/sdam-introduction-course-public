@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from inventory.pomdp import MultiRegimeBeliefTracker
 
 
 def _require_matplotlib_pyplot():
@@ -1054,6 +1055,406 @@ def plot_regime_sample_path(
     return fig, (ax_d, ax_r), demand_path, regime_path
 
 
+def plot_forecast_vs_actual(
+    forecasters: Mapping[str, object],
+    exog,
+    state0: np.ndarray,
+    T: int,
+    episode_seed: int,
+    *,
+    H: int = 1,
+    k: int = 1,
+    demand_history_window: int = 7,
+    figsize: Tuple[float, float] = (14, 6),
+    show: bool = True,
+):
+    """Compare k-step-ahead demand predictions from multiple forecasters against simulated actual demand.
+
+    Simulates a single demand path using the same strict-CRN seed logic as
+    ``plot_multi_regime_sample_path``, then at each decision time t evaluates each
+    forecaster's H-step-ahead mean path and records element ``mu[k-1]`` (0-indexed) as the
+    k-step-ahead point forecast for D_{t+k}.
+
+    **Index convention**
+
+    * ``demand_path[t]`` = D_{t+1}  (demand realised *after* state at time t)
+    * At decision time t, ``mu = forecast_mean_path(state_t, t, H)``; ``mu[k-1]`` predicts D_{t+k}.
+    * The corresponding actual value is ``demand_path[t+k-1]`` = D_{t+k}.
+    * Valid comparison points: t = 0, 1, …, T−k  →  n = T−k+1 pairs.
+    * The x-axis shows the *time of realisation* (t+k), ranging from k to T.
+
+    When k=1 (default) this reduces to pure 1-step-ahead evaluation and the comparison
+    covers the full horizon (all T steps).
+
+    The resulting plot is a 2-panel grid (stacked, shared x-axis):
+
+    * **Top panel** – actual demand path (black) overlaid with each forecaster's k-step-ahead
+      predictions (one dashed coloured line per forecaster).
+    * **Bottom panel** – per-step forecast error (predicted − actual) for each forecaster.
+
+    A compact numerical quality table (MAE, RMSE, Bias) is printed to stdout.
+
+    Args:
+        forecasters: dict mapping forecaster name -> forecaster object.
+            Each forecaster must implement
+            ``forecast_mean_path(state, t, H, *, info=None) -> array of shape (H,)``.
+        exog: exogenous demand model.  Must implement ``.sample(state, action, t, rng)``.
+            If it additionally exposes ``season_index``, ``day_index``, ``weather_index``
+            the regime components of the state are updated automatically.
+        state0: initial state vector (1-D array).
+        T: simulation horizon (number of steps).
+        episode_seed: integer seed for the strict-CRN step-seed sequence.
+        H: planning horizon passed to ``forecast_mean_path``.  Must satisfy H >= k.
+        k: which step of the forecast path to evaluate (1-indexed).  k=1 → 1-step-ahead,
+           k=3 → 3-step-ahead, etc.  Must satisfy 1 <= k <= H.
+        figsize: figure size in inches.
+        show: whether to call ``plt.show()``.
+
+    Returns:
+        (fig, axes, metrics_by_forecaster)
+
+        * ``fig`` – matplotlib Figure
+        * ``axes`` – (ax_top, ax_delta)
+        * ``metrics_by_forecaster`` – dict mapping forecaster name ->
+          ``{"MAE": float, "RMSE": float, "Bias": float, "n": int}``
+    """
+
+    plt = _require_matplotlib_pyplot()
+
+    T = int(T)
+    H = int(H)
+    k = int(k)
+    if T <= 0:
+        raise ValueError(f"T must be positive, got {T}.")
+    if H < 1:
+        raise ValueError(f"H must be >= 1, got {H}.")
+    if not (1 <= k <= H):
+        raise ValueError(f"k must satisfy 1 <= k <= H. Got k={k}, H={H}.")
+
+    state0 = np.asarray(state0, dtype=float).reshape(-1)
+
+    # --- Simulate the demand path (same CRN logic as plot_multi_regime_sample_path) ---
+    ss = np.random.SeedSequence(int(episode_seed))
+    child = ss.spawn(T)
+    step_seeds = np.array([int(c.generate_state(1)[0]) for c in child], dtype=np.int64)
+
+    state = state0.copy()
+    dummy_action = np.zeros(1, dtype=float)
+
+    demand_path = np.empty(T, dtype=float)          # demand_path[t] = D_{t+1}
+    state_path = np.empty((T + 1, state0.shape[0]), dtype=float)
+    state_path[0] = state0.copy()
+
+    # Detect multi-regime exog so we can update state with next-period regimes
+    _is_multi_regime = all(hasattr(exog, a) for a in ("season_index", "day_index", "weather_index"))
+    if _is_multi_regime:
+        _si = int(exog.season_index)
+        _di = int(exog.day_index)
+        _wi = int(exog.weather_index)
+
+    for t in range(T):
+        rng_t = np.random.default_rng(int(step_seeds[t]))
+        w_tp1 = np.asarray(exog.sample(state, dummy_action, int(t), rng_t), dtype=float).reshape(-1)
+        demand_path[t] = float(w_tp1[0])
+        if _is_multi_regime and w_tp1.shape[0] >= 4:
+            state[_si] = float(w_tp1[1])
+            state[_di] = float(w_tp1[2])
+            state[_wi] = float(w_tp1[3])
+        state_path[t + 1] = state.copy()
+
+    # --- Build k-step-ahead prediction and actual arrays ---
+    # n_valid comparison points: t = 0 .. T-k  (realization time = t+k = k .. T)
+    n_valid = T - k + 1
+    # actual[i] = D_{i+k} = demand_path[i + k - 1]  for i = 0 .. T-k
+    actual = demand_path[k - 1: T].copy()   # shape (n_valid,)
+
+    preds_by_forecaster: Dict[str, np.ndarray] = {}
+    for name, forecaster in forecasters.items():
+        preds = np.full(n_valid, np.nan, dtype=float)
+        for i in range(n_valid):   # i = decision time t = 0 .. T-k
+            # Build info: always include last_demand (for NaiveForecaster etc.) and
+            # demand_history as a rolling window of the last demand_history_window
+            # realised demands (for AR(p) forecasters).
+            if i > 0:
+                window_start = max(0, i - int(demand_history_window))
+                history = demand_path[window_start:i].copy()
+                info: Optional[dict] = {
+                    "last_demand": float(demand_path[i - 1]),
+                    "demand_history": history,
+                }
+            else:
+                info = None
+            try:
+                mu = np.asarray(
+                    forecaster.forecast_mean_path(state_path[i], t=i, H=H, info=info),  # type: ignore[attr-defined]
+                    dtype=float,
+                ).reshape(-1)
+                if mu.shape[0] >= k:
+                    preds[i] = float(mu[k - 1])  # k-step-ahead element (0-indexed: k-1)
+            except Exception:
+                pass
+        preds_by_forecaster[name] = preds
+
+    # --- Compute metrics ---
+    metrics_by_forecaster: Dict[str, dict] = {}
+    for name, preds in preds_by_forecaster.items():
+        valid = np.isfinite(preds) & np.isfinite(actual)
+        if not valid.any():
+            metrics_by_forecaster[name] = {"MAE": np.nan, "RMSE": np.nan, "Bias": np.nan, "n": 0}
+            continue
+        err = preds[valid] - actual[valid]  # predicted − actual
+        metrics_by_forecaster[name] = {
+            "MAE": float(np.mean(np.abs(err))),
+            "RMSE": float(np.sqrt(np.mean(err ** 2))),
+            "Bias": float(np.mean(err)),
+            "n": int(valid.sum()),
+        }
+
+    # --- Print quality table ---
+    print(f"=== Forecast quality metrics  (H={H}, k={k}, {k}-step-ahead, T={T}, seed={episode_seed}) ===")
+    print(f"{'Forecaster':<30} {'MAE':>10} {'RMSE':>10} {'Bias':>10} {'n':>6}")
+    print("-" * 68)
+    for name, m in metrics_by_forecaster.items():
+        print(f"{name:<30} {m['MAE']:>10.3f} {m['RMSE']:>10.3f} {m['Bias']:>10.3f} {m['n']:>6}")
+
+    # --- Plot ---
+    cmap = plt.get_cmap("tab10")
+    # x = time of realisation: t+k for t=0..T-k  →  k, k+1, ..., T
+    t_axis = np.arange(k, T + 1)
+
+    fig, axes = plt.subplots(2, 1, figsize=figsize, constrained_layout=True, sharex=True)
+    ax_top, ax_delta = axes
+
+    # Top panel: full actual demand path (black) + k-step-ahead predictions
+    ax_top.plot(
+        np.arange(1, T + 1), demand_path,
+        color="black", linewidth=1.2, alpha=0.35, label="Actual demand (full path)",
+    )
+    ax_top.plot(
+        t_axis, actual,
+        color="black", linewidth=1.2,alpha=0.35, label=f"Actual D_{{t+{k}}} (comparison window)",
+    )
+    for idx, (name, preds) in enumerate(preds_by_forecaster.items()):
+        color = cmap(idx % 10)
+        m = metrics_by_forecaster[name]
+        label = f"{name}  (MAE={m['MAE']:.1f}, Bias={m['Bias']:.1f})"
+        ax_top.plot(t_axis, preds, color=color, linewidth=1.2, linestyle="--", alpha=0.85, label=label)
+    ax_top.set_ylabel("Demand")
+    ax_top.set_title(
+        f"Actual demand vs. {k}-step-ahead predictions  (H={H}, k={k}, seed={episode_seed})"
+    )
+    ax_top.legend(fontsize=8)
+    ax_top.grid(True, alpha=0.2)
+
+    # Bottom panel: forecast error (predicted − actual)
+    ax_delta.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+    for idx, (name, preds) in enumerate(preds_by_forecaster.items()):
+        color = cmap(idx % 10)
+        delta = preds - actual
+        ax_delta.plot(t_axis, delta, color=color, linewidth=1.0, alpha=0.75, label=name)
+    ax_delta.set_xlabel(f"t  (time of D_{{t+{k}}} realisation)")
+    ax_delta.set_ylabel("Forecast error\n(predicted − actual)")
+    ax_delta.set_title(f"{k}-step-ahead forecast error per step")
+    ax_delta.legend(fontsize=8)
+    ax_delta.grid(True, alpha=0.2)
+
+    if show:
+        plt.show()
+
+    return fig, axes, metrics_by_forecaster
+
+
+def plot_forecast_accuracy_vs_k(
+    forecasters: Mapping[str, object],
+    exog,
+    state0: np.ndarray,
+    T: int,
+    episode_seed: int,
+    *,
+    k_values: Sequence[int] = (1, 2, 3, 4, 5),
+    metrics: Sequence[str] = ("MAE", "RMSE", "Bias"),
+    demand_history_window: int = 7,
+    figsize: Tuple[float, float] = (12, 4),
+    show: bool = True,
+):
+    """Sweep over forecast horizons k and plot accuracy metrics vs k for multiple forecasters.
+
+    At each decision time t a single call to ``forecast_mean_path(state_t, t, H=max_k)``
+    is made per forecaster, returning a full path of length ``max_k``.  Element ``mu[k-1]``
+    is then used as the k-step-ahead prediction for every k in ``k_values``, so the
+    simulation is run only once regardless of how many k values are requested.
+
+    This directly answers the question "how fast does forecast accuracy degrade as the
+    planning horizon grows?" — which is the key diagnostic for choosing H in
+    ``OrderMilpCfaPolicy``.
+
+    **Plot layout** — one subplot per metric (MAE, RMSE, Bias), side by side.
+    Each forecaster is one coloured line.  A horizontal dashed line at 0 is added
+    to the Bias panel for reference.
+
+    A full numerical table (metric × k) is printed to stdout for each forecaster.
+
+    Args:
+        forecasters: dict mapping forecaster name -> forecaster object.
+        exog: exogenous demand model with ``.sample(state, action, t, rng)``.
+        state0: initial state vector (1-D array).
+        T: simulation horizon (number of steps).
+        episode_seed: strict-CRN seed for the demand path.
+        k_values: sequence of forecast steps to evaluate (1-indexed, all >= 1).
+        metrics: which metrics to plot.  Any subset of ``("MAE", "RMSE", "Bias")``.
+        figsize: figure size in inches.
+        show: whether to call ``plt.show()``.
+
+    Returns:
+        (fig, axes, results_by_forecaster)
+
+        * ``fig`` – matplotlib Figure
+        * ``axes`` – array of Axes (one per metric)
+        * ``results_by_forecaster`` – nested dict
+          ``{forecaster_name: {k: {"MAE", "RMSE", "Bias", "n"}}}``
+    """
+
+    plt = _require_matplotlib_pyplot()
+
+    T = int(T)
+    k_values = sorted(set(int(k) for k in k_values))
+    if not k_values:
+        raise ValueError("k_values must be non-empty.")
+    if any(k < 1 for k in k_values):
+        raise ValueError("All k values must be >= 1.")
+    max_k = max(k_values)
+
+    state0 = np.asarray(state0, dtype=float).reshape(-1)
+
+    # --- Simulate the demand path once ---
+    ss = np.random.SeedSequence(int(episode_seed))
+    child = ss.spawn(T)
+    step_seeds = np.array([int(c.generate_state(1)[0]) for c in child], dtype=np.int64)
+
+    state = state0.copy()
+    dummy_action = np.zeros(1, dtype=float)
+
+    demand_path = np.empty(T, dtype=float)
+    state_path = np.empty((T + 1, state0.shape[0]), dtype=float)
+    state_path[0] = state0.copy()
+
+    _is_multi_regime = all(hasattr(exog, a) for a in ("season_index", "day_index", "weather_index"))
+    if _is_multi_regime:
+        _si = int(exog.season_index)
+        _di = int(exog.day_index)
+        _wi = int(exog.weather_index)
+
+    for t in range(T):
+        rng_t = np.random.default_rng(int(step_seeds[t]))
+        w_tp1 = np.asarray(exog.sample(state, dummy_action, int(t), rng_t), dtype=float).reshape(-1)
+        demand_path[t] = float(w_tp1[0])
+        if _is_multi_regime and w_tp1.shape[0] >= 4:
+            state[_si] = float(w_tp1[1])
+            state[_di] = float(w_tp1[2])
+            state[_wi] = float(w_tp1[3])
+        state_path[t + 1] = state.copy()
+
+    # --- Collect all-horizon predictions in one pass per forecaster ---
+    # For decision time i, we call forecast_mean_path with H=max_k once and store the
+    # full path.  Then for each k we slice mu[k-1] as the k-step-ahead prediction.
+    # Valid comparison pairs for step k: i = 0 .. T-k, actual = demand_path[i+k-1].
+
+    # preds_all[name][i, :] = forecast path of length max_k issued at decision time i
+    #   (only rows 0 .. T-max_k are needed for the longest k, but we store all T rows)
+    results_by_forecaster: Dict[str, Dict[int, dict]] = {}
+
+    for name, forecaster in forecasters.items():
+        # store max_k-length forecast paths; rows beyond T-max_k unused for large k
+        preds_all = np.full((T, max_k), np.nan, dtype=float)
+        for i in range(T):
+            # Build info: always include last_demand (for NaiveForecaster etc.) and
+            # demand_history as a rolling window of the last demand_history_window
+            # realised demands (for AR(p) forecasters).
+            if i > 0:
+                window_start = max(0, i - int(demand_history_window))
+                history = demand_path[window_start:i].copy()
+                info: Optional[dict] = {
+                    "last_demand": float(demand_path[i - 1]),
+                    "demand_history": history,
+                }
+            else:
+                info = None
+            try:
+                mu = np.asarray(
+                    forecaster.forecast_mean_path(state_path[i], t=i, H=max_k, info=info),  # type: ignore[attr-defined]
+                    dtype=float,
+                ).reshape(-1)
+                copy_len = min(mu.shape[0], max_k)
+                preds_all[i, :copy_len] = mu[:copy_len]
+            except Exception:
+                pass
+
+        # Compute metrics for each k
+        k_metrics: Dict[int, dict] = {}
+        for k in k_values:
+            n_valid_pairs = T - k + 1
+            actual_k = demand_path[k - 1: T]          # D_{i+k} for i=0..T-k
+            preds_k = preds_all[:n_valid_pairs, k - 1] # mu[k-1] issued at time i=0..T-k
+            valid = np.isfinite(preds_k) & np.isfinite(actual_k)
+            if not valid.any():
+                k_metrics[k] = {"MAE": np.nan, "RMSE": np.nan, "Bias": np.nan, "n": 0}
+                continue
+            err = preds_k[valid] - actual_k[valid]
+            k_metrics[k] = {
+                "MAE": float(np.mean(np.abs(err))),
+                "RMSE": float(np.sqrt(np.mean(err ** 2))),
+                "Bias": float(np.mean(err)),
+                "n": int(valid.sum()),
+            }
+        results_by_forecaster[name] = k_metrics
+
+    # --- Print table ---
+    for name, k_metrics in results_by_forecaster.items():
+        print(f"\n=== {name} — accuracy vs k  (T={T}, seed={episode_seed}) ===")
+        print(f"{'k':>4} {'MAE':>10} {'RMSE':>10} {'Bias':>10} {'n':>6}")
+        print("-" * 44)
+        for k in k_values:
+            m = k_metrics[k]
+            print(f"{k:>4} {m['MAE']:>10.3f} {m['RMSE']:>10.3f} {m['Bias']:>10.3f} {m['n']:>6}")
+
+    # --- Plot ---
+    metrics_to_plot = [m for m in metrics if m in ("MAE", "RMSE", "Bias")]
+    if not metrics_to_plot:
+        raise ValueError(f"metrics must contain at least one of 'MAE', 'RMSE', 'Bias'. Got {metrics}.")
+
+    cmap = plt.get_cmap("tab10")
+    n_panels = len(metrics_to_plot)
+    fig, axes_arr = plt.subplots(1, n_panels, figsize=figsize, constrained_layout=True, squeeze=False)
+    axes_arr = axes_arr.reshape(-1)
+
+    k_arr = np.array(k_values)
+
+    for panel_idx, metric_name in enumerate(metrics_to_plot):
+        ax = axes_arr[panel_idx]
+        for forecaster_idx, (name, k_metrics) in enumerate(results_by_forecaster.items()):
+            color = cmap(forecaster_idx % 10)
+            vals = np.array([k_metrics[k][metric_name] for k in k_values], dtype=float)
+            ax.plot(k_arr, vals, marker="o", linewidth=1.8, color=color, label=name)
+        if metric_name == "Bias":
+            ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax.set_title(f"{metric_name} vs forecast horizon k")
+        ax.set_xlabel("k  (step ahead)")
+        ax.set_ylabel(metric_name)
+        ax.set_xticks(k_arr)
+        ax.grid(True, alpha=0.2)
+        ax.legend(fontsize=8)
+
+    fig.suptitle(
+        f"Forecast accuracy vs horizon  (T={T}, seed={episode_seed}, max_k={max_k})",
+        fontsize=10,
+    )
+
+    if show:
+        plt.show()
+
+    return fig, axes_arr, results_by_forecaster
+
+
 def plot_multi_regime_sample_path(
     exog,
     T: int,
@@ -1283,6 +1684,417 @@ def plot_seasonal_reference_episode_sample_path(
         plt.show()
 
     return fig, axes, demand_path, lambda_path, ref_episode_seed
+
+
+def collect_hidden_reference_episode_diagnostics(
+    exog,
+    T: int,
+    *,
+    seed0: int = 1234,
+    n_episodes: int = 200,
+):
+    """Reconstruct hidden multi-regime dynamics on the CRN reference episode.
+
+    Intended for partially observable multi-regime exogenous models that keep
+    season/day/weather regimes internally and expose only demand to the policy.
+
+    Returns:
+      (demand_path, lambda_path, regimes_path, ref_episode_seed)
+
+    where:
+    - demand_path has shape (T,)
+    - lambda_path has shape (T,)
+    - regimes_path has shape (T + 1, 3) with columns (season, day, weather)
+    """
+
+    T = int(T)
+    if T <= 0:
+        raise ValueError(f"T must be positive. Got T={T}.")
+
+    for attr in ("sample", "reset_episode", "current_hidden_regimes", "lambda_for_regimes"):
+        if not hasattr(exog, attr):
+            raise TypeError(f"exog must define .{attr} for hidden-regime diagnostics")
+
+    seed0 = int(seed0)
+    n_episodes = int(n_episodes)
+    if n_episodes <= 0:
+        raise ValueError(f"n_episodes must be positive. Got n_episodes={n_episodes}.")
+
+    rng = np.random.default_rng(seed0)
+    episode_seeds = [int(s) for s in rng.integers(1, 2**31 - 1, size=n_episodes)]
+    ref_episode_seed = int(episode_seeds[0])
+
+    ss = np.random.SeedSequence(ref_episode_seed)
+    child = ss.spawn(T)
+    step_seeds = np.array([int(c.generate_state(1)[0]) for c in child], dtype=np.int64)
+
+    state_dummy = np.zeros(1, dtype=float)
+    action_dummy = np.zeros(1, dtype=float)
+
+    exog.reset_episode()
+    regimes_path = np.empty((T + 1, 3), dtype=int)
+    regimes_path[0] = np.asarray(exog.current_hidden_regimes(), dtype=int)
+
+    demand_path = np.empty(T, dtype=float)
+    lambda_path = np.empty(T, dtype=float)
+
+    for t in range(T):
+        rng_t = np.random.default_rng(int(step_seeds[t]))
+        w_tp1 = np.asarray(exog.sample(state_dummy, action_dummy, t, rng_t), dtype=float).reshape(-1)
+        if w_tp1.shape[0] < 1:
+            raise ValueError(f"exog.sample(...) must return at least 1 element [demand]. Got {w_tp1.shape}.")
+
+        demand_path[t] = float(w_tp1[0])
+        r_season, r_day, r_weather = exog.current_hidden_regimes()
+        regimes_path[t + 1] = np.array([r_season, r_day, r_weather], dtype=int)
+        lambda_path[t] = float(exog.lambda_for_regimes(r_season, r_day, r_weather))
+
+    exog.reset_episode()
+    return demand_path, lambda_path, regimes_path, ref_episode_seed
+
+
+def _make_belief_tracker(exog=None, tracker_factory=None):
+    if tracker_factory is None:
+        if exog is None:
+            raise ValueError("Provide either exog or tracker_factory.")
+        tracker_factory = lambda: MultiRegimeBeliefTracker(exog)
+
+    tracker = tracker_factory()
+    for attr in ("reset", "observe_step", "belief_mean_lambda", "belief_marginals"):
+        if not hasattr(tracker, attr):
+            raise TypeError(f"tracker created by tracker_factory must define .{attr}")
+    tracker.reset()
+    return tracker
+
+
+def _as_rollout_2d(x, name: str) -> np.ndarray:
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    if arr.ndim == 2:
+        return arr
+    raise ValueError(f"{name} must be a 1D or 2D array. Got shape {arr.shape}.")
+
+
+def collect_rollout_belief_diagnostics(
+    rollout: Mapping[str, np.ndarray],
+    *,
+    exog=None,
+    tracker_factory=None,
+):
+    """Reconstruct belief traces from a stored rollout's realized demand path.
+
+    The rollout is expected to contain the usual keys produced by
+    ``DynamicSystem.evaluate_policies_crn_mc(...)`` or
+    ``DynamicSystem.collect_policies_crn_rollouts_mc(...)``: ``traj``,
+    ``actions``, ``costs``, and ``ws``.
+    """
+
+    if not isinstance(rollout, Mapping):
+        raise ValueError("rollout must be a mapping with keys 'traj', 'actions', 'costs', and 'ws'.")
+
+    missing = [name for name in ("traj", "actions", "costs", "ws") if name not in rollout]
+    if missing:
+        raise ValueError(f"rollout is missing required keys: {missing}")
+
+    tracker = _make_belief_tracker(exog=exog, tracker_factory=tracker_factory)
+
+    traj = _as_rollout_2d(rollout["traj"], "traj")
+    actions = _as_rollout_2d(rollout["actions"], "actions")
+    costs = np.asarray(rollout["costs"], dtype=float).reshape(-1)
+    ws = _as_rollout_2d(rollout["ws"], "ws")
+
+    T = int(ws.shape[0])
+    if T <= 0:
+        raise ValueError("rollout['ws'] must contain at least one realized exogenous step.")
+    if traj.shape[0] < T + 1:
+        raise ValueError(f"rollout['traj'] must have at least T+1 rows. Got {traj.shape[0]} for T={T}.")
+    if actions.shape[0] < T:
+        raise ValueError(f"rollout['actions'] must have at least T rows. Got {actions.shape[0]} for T={T}.")
+    if costs.shape[0] < T:
+        raise ValueError(f"rollout['costs'] must have at least T entries. Got {costs.shape[0]} for T={T}.")
+
+    demand_path = np.asarray(ws[:T, 0], dtype=float)
+    initial_marginals = tracker.belief_marginals()
+    season_marginals = np.empty((T, np.asarray(initial_marginals.season, dtype=float).size), dtype=float)
+    day_marginals = np.empty((T, np.asarray(initial_marginals.day, dtype=float).size), dtype=float)
+    weather_marginals = np.empty((T, np.asarray(initial_marginals.weather, dtype=float).size), dtype=float)
+    posterior_mean_lambda = np.empty(T, dtype=float)
+
+    for t in range(T):
+        tracker.observe_step(demand_path[t], t)
+        posterior_mean_lambda[t] = float(tracker.belief_mean_lambda())
+        marginals = tracker.belief_marginals()
+        season_marginals[t] = np.asarray(marginals.season, dtype=float)
+        day_marginals[t] = np.asarray(marginals.day, dtype=float)
+        weather_marginals[t] = np.asarray(marginals.weather, dtype=float)
+
+    return {
+        "traj": traj[: T + 1],
+        "actions": actions[:T],
+        "costs": costs[:T],
+        "ws": ws[:T],
+        "demand_path": demand_path,
+        "posterior_mean_lambda": posterior_mean_lambda,
+        "season_marginals": season_marginals,
+        "day_marginals": day_marginals,
+        "weather_marginals": weather_marginals,
+    }
+
+
+def plot_rollout_belief_diagnostics(
+    rollout: Mapping[str, np.ndarray],
+    *,
+    exog=None,
+    tracker_factory=None,
+    policy_name: Optional[str] = None,
+    state_index: int = 0,
+    action_index: int = 0,
+    figsize: Tuple[float, float] = (14, 12),
+    show: bool = True,
+):
+    """Plot reconstructed belief traces together with state and action paths for one rollout."""
+
+    plt = _require_matplotlib_pyplot()
+    summary = collect_rollout_belief_diagnostics(
+        rollout,
+        exog=exog,
+        tracker_factory=tracker_factory,
+    )
+
+    traj = np.asarray(summary["traj"], dtype=float)
+    actions = np.asarray(summary["actions"], dtype=float)
+    demand_path = np.asarray(summary["demand_path"], dtype=float)
+    posterior_mean_lambda = np.asarray(summary["posterior_mean_lambda"], dtype=float)
+    season_marginals = np.asarray(summary["season_marginals"], dtype=float)
+    weather_marginals = np.asarray(summary["weather_marginals"], dtype=float)
+
+    if not (0 <= state_index < traj.shape[1]):
+        raise ValueError(f"state_index={state_index} out of range for dS={traj.shape[1]}.")
+    if not (0 <= action_index < actions.shape[1]):
+        raise ValueError(f"action_index={action_index} out of range for dX={actions.shape[1]}.")
+
+    T = int(demand_path.shape[0])
+    ts = np.arange(1, T + 1)
+    tp1 = np.arange(T + 1)
+
+    fig, axes = plt.subplots(5, 1, figsize=figsize, constrained_layout=True, sharex=False)
+    ax_s, ax_x, ax_d, ax_ps, ax_pw = axes
+
+    title = "Rollout belief diagnostics"
+    if policy_name:
+        title = f"{title} ({policy_name})"
+
+    ax_s.plot(tp1, traj[:, state_index], linewidth=1.8)
+    ax_s.set_title(title)
+    ax_s.set_ylabel("State")
+    ax_s.grid(True, alpha=0.2)
+
+    ax_x.plot(ts, actions[:, action_index], linewidth=1.8, color="tab:green")
+    ax_x.set_ylabel("Action")
+    ax_x.grid(True, alpha=0.2)
+
+    ax_d.plot(ts, demand_path, linewidth=1.5, marker="o", color="tab:gray", label="realized demand")
+    ax_d.plot(ts, posterior_mean_lambda, linewidth=2.0, color="tab:blue", label="posterior mean lambda")
+    ax_d.set_ylabel("Demand")
+    ax_d.legend(loc="best")
+    ax_d.grid(True, alpha=0.2)
+
+    for idx in range(season_marginals.shape[1]):
+        ax_ps.plot(ts, season_marginals[:, idx], linewidth=1.4, label=f"season={idx}")
+    ax_ps.set_ylabel("P(season)")
+    ax_ps.legend(loc="upper right", ncol=min(4, season_marginals.shape[1]))
+    ax_ps.grid(True, alpha=0.2)
+
+    for idx in range(weather_marginals.shape[1]):
+        ax_pw.plot(ts, weather_marginals[:, idx], linewidth=1.4, label=f"weather={idx}")
+    ax_pw.set_xlabel("t")
+    ax_pw.set_ylabel("P(weather)")
+    ax_pw.legend(loc="upper right", ncol=min(3, weather_marginals.shape[1]))
+    ax_pw.grid(True, alpha=0.2)
+
+    if show:
+        plt.show()
+
+    return fig, axes, summary
+
+
+def collect_hidden_reference_episode_belief_diagnostics(
+    exog,
+    T: int,
+    *,
+    seed0: int = 1234,
+    n_episodes: int = 200,
+    tracker_factory=None,
+):
+    """Collect belief diagnostics on the CRN reference episode.
+
+    Returns a dict with realized demand, true latent lambda, posterior mean lambda,
+    selected belief marginals, and the underlying hidden regime path.
+    """
+
+    demand_path, lambda_path, regimes_path, ref_episode_seed = collect_hidden_reference_episode_diagnostics(
+        exog,
+        T,
+        seed0=seed0,
+        n_episodes=n_episodes,
+    )
+
+    tracker = _make_belief_tracker(exog=exog, tracker_factory=tracker_factory)
+    T = int(T)
+    posterior_mean_lambda = np.empty(T, dtype=float)
+    season_marginals = np.empty((T, exog.P_season.shape[0]), dtype=float)
+    weather_marginals = np.empty((T, exog.P_weather.shape[0]), dtype=float)
+
+    for t in range(T):
+        tracker.observe_step(demand_path[t], t)
+        posterior_mean_lambda[t] = float(tracker.belief_mean_lambda())
+        marginals = tracker.belief_marginals()
+        season_marginals[t] = np.asarray(marginals.season, dtype=float)
+        weather_marginals[t] = np.asarray(marginals.weather, dtype=float)
+
+    return {
+        "demand_path": demand_path,
+        "lambda_path": lambda_path,
+        "posterior_mean_lambda": posterior_mean_lambda,
+        "season_marginals": season_marginals,
+        "weather_marginals": weather_marginals,
+        "regimes_path": regimes_path,
+        "ref_episode_seed": ref_episode_seed,
+    }
+
+
+def plot_hidden_reference_episode_belief_diagnostics(
+    exog,
+    T: int,
+    *,
+    seed0: int = 1234,
+    n_episodes: int = 200,
+    tracker_factory=None,
+    figsize: Tuple[float, float] = (14, 10),
+    show: bool = True,
+):
+    """Plot belief tracking diagnostics on the CRN reference episode."""
+
+    plt = _require_matplotlib_pyplot()
+    summary = collect_hidden_reference_episode_belief_diagnostics(
+        exog,
+        T,
+        seed0=seed0,
+        n_episodes=n_episodes,
+        tracker_factory=tracker_factory,
+    )
+
+    demand_path = np.asarray(summary["demand_path"], dtype=float)
+    lambda_path = np.asarray(summary["lambda_path"], dtype=float)
+    posterior_mean_lambda = np.asarray(summary["posterior_mean_lambda"], dtype=float)
+    season_marginals = np.asarray(summary["season_marginals"], dtype=float)
+    weather_marginals = np.asarray(summary["weather_marginals"], dtype=float)
+    ref_episode_seed = int(summary["ref_episode_seed"])
+
+    T = int(T)
+    fig, axes = plt.subplots(4, 1, figsize=figsize, constrained_layout=True, sharex=True)
+    ax_d, ax_lam, ax_s, ax_w = axes
+
+    ts = np.arange(1, T + 1)
+    ax_d.plot(ts, demand_path, marker="o", linewidth=1.5)
+    ax_d.set_title(
+        f"Belief diagnostics on the CRN reference episode (seed0={seed0}, ref_episode_seed={ref_episode_seed})"
+    )
+    ax_d.set_ylabel("Demand")
+    ax_d.grid(True, alpha=0.2)
+
+    ax_lam.plot(ts, lambda_path, linewidth=2.0, color="tab:orange", label="true latent lambda")
+    ax_lam.plot(ts, posterior_mean_lambda, linewidth=2.0, color="tab:blue", label="posterior mean lambda")
+    ax_lam.set_ylabel("lambda")
+    ax_lam.legend(loc="best")
+    ax_lam.grid(True, alpha=0.2)
+
+    for idx in range(season_marginals.shape[1]):
+        ax_s.plot(ts, season_marginals[:, idx], linewidth=1.5, label=f"season={idx}")
+    ax_s.set_ylabel("P(season)")
+    ax_s.legend(loc="upper right", ncol=2)
+    ax_s.grid(True, alpha=0.2)
+
+    for idx in range(weather_marginals.shape[1]):
+        ax_w.plot(ts, weather_marginals[:, idx], linewidth=1.5, label=f"weather={idx}")
+    ax_w.set_xlabel("t")
+    ax_w.set_ylabel("P(weather)")
+    ax_w.legend(loc="upper right")
+    ax_w.grid(True, alpha=0.2)
+
+    if show:
+        plt.show()
+
+    return fig, axes, summary
+
+
+def plot_hidden_reference_episode_diagnostics(
+    exog,
+    T: int,
+    *,
+    seed0: int = 1234,
+    n_episodes: int = 200,
+    figsize: Tuple[float, float] = (14, 12),
+    show: bool = True,
+):
+    """Plot hidden multi-regime diagnostics on the CRN reference episode.
+
+    Returns:
+      (fig, axes, summary)
+
+    where summary is a small dict with initial/final regimes and lambda stats.
+    """
+
+    plt = _require_matplotlib_pyplot()
+
+    demand_path, lambda_path, regimes_path, ref_episode_seed = collect_hidden_reference_episode_diagnostics(
+        exog,
+        T,
+        seed0=seed0,
+        n_episodes=n_episodes,
+    )
+
+    T = int(T)
+    fig, axes = plt.subplots(5, 1, figsize=figsize, constrained_layout=True, sharex=True)
+    ax_d, ax_lam, ax_s, ax_day, ax_w = axes
+
+    ax_d.plot(np.arange(1, T + 1), demand_path, marker="o", linewidth=1.5)
+    ax_d.set_title(
+        f"Latent-regime diagnostics on the CRN reference episode (seed0={seed0}, ref_episode_seed={ref_episode_seed})"
+    )
+    ax_d.set_ylabel("Demand")
+    ax_d.grid(True, alpha=0.2)
+
+    ax_lam.plot(np.arange(1, T + 1), lambda_path, marker="o", linewidth=1.5, color="tab:orange")
+    ax_lam.set_ylabel("lambda_eff")
+    ax_lam.grid(True, alpha=0.2)
+
+    ts = np.arange(0, T + 1)
+    ax_s.step(ts, regimes_path[:, 0], where="post", linewidth=1.5, color="tab:green")
+    ax_s.set_ylabel("Season")
+    ax_s.grid(True, alpha=0.2)
+
+    ax_day.step(ts, regimes_path[:, 1], where="post", linewidth=1.5, color="tab:red")
+    ax_day.set_ylabel("Day")
+    ax_day.grid(True, alpha=0.2)
+
+    ax_w.step(ts, regimes_path[:, 2], where="post", linewidth=1.5, color="tab:purple")
+    ax_w.set_xlabel("t")
+    ax_w.set_ylabel("Weather")
+    ax_w.grid(True, alpha=0.2)
+
+    if show:
+        plt.show()
+
+    summary = {
+        "initial_hidden_regimes": tuple(regimes_path[0]),
+        "final_hidden_regimes": tuple(regimes_path[-1]),
+        "mean_effective_lambda": float(lambda_path.mean()),
+        "min_effective_lambda": float(lambda_path.min()),
+        "max_effective_lambda": float(lambda_path.max()),
+    }
+    return fig, axes, summary
 
 
 def plot_seasonal_adapter_sample_paths(
@@ -1683,6 +2495,12 @@ __all__ = [
     "plot_rollouts_overlay_grid",
     "plot_regime_sample_path",
     "plot_seasonal_reference_episode_sample_path",
+    "collect_hidden_reference_episode_diagnostics",
+    "collect_rollout_belief_diagnostics",
+    "plot_hidden_reference_episode_diagnostics",
+    "collect_hidden_reference_episode_belief_diagnostics",
+    "plot_hidden_reference_episode_belief_diagnostics",
+    "plot_rollout_belief_diagnostics",
     "plot_seasonal_adapter_sample_paths",
     "plot_regime_adapter_sample_paths",
 ]

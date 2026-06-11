@@ -5,7 +5,13 @@ from typing import Optional
 import numpy as np
 from inventory.core.types import State
 from inventory.forecasters.base import DemandForecaster
-from inventory.forecasters.ml import MultiRegimeFeatureAdapter, RegimeFeatureAdapter, SeasonalFeatureAdapter, regression_metrics
+from inventory.forecasters.ml import (
+    ConstantFeatureAdapter,
+    MultiRegimeFeatureAdapter,
+    RegimeFeatureAdapter,
+    SeasonalFeatureAdapter,
+    regression_metrics,
+)
 
 
 class EtsDemandForecaster(DemandForecaster):
@@ -138,14 +144,49 @@ class EtsDemandForecaster(DemandForecaster):
         }
         return self
 
+    def _extract_recent_endog(self, info: Optional[dict]) -> Optional[np.ndarray]:
+        """Extract recent realized demand to re-anchor ETS internal state.
+
+        Preference order:
+        1) info["demand_history"] (bounded vector, most informative)
+        2) info["last_demand"]    (single value fallback)
+        """
+        if not info:
+            return None
+
+        if "demand_history" in info:
+            vals = np.asarray(info["demand_history"], dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 1:
+                return np.maximum(vals, 0.0).astype(float)
+
+        if "last_demand" in info:
+            vals = np.asarray(info["last_demand"], dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 1:
+                return np.maximum(vals, 0.0).astype(float)
+
+        return None
+
     def forecast_mean_path(self, state: State, t: int, H: int, info: Optional[dict] = None) -> np.ndarray:
-        _ = state, t, info
+        _ = state, t
         if not self._trained or self._results is None:
             raise RuntimeError("EtsDemandForecaster must be trained first.")
 
         H = int(H)
         if H <= 0:
             return np.zeros(0, dtype=float)
+
+        recent = self._extract_recent_endog(info)
+        if recent is not None and recent.size >= 1:
+            try:
+                # Re-anchor the ETS level/trend/seasonal state to recent realized demand,
+                # then forecast forward from that updated state.
+                updated = self._results.apply(recent, refit=False)
+                mu = np.asarray(updated.forecast(H), dtype=float).reshape(-1)
+                return np.maximum(mu, 0.0).astype(float)
+            except Exception:
+                pass  # fall through to the frozen-state fallback below
 
         mu = np.asarray(self._results.forecast(H), dtype=float).reshape(-1)
         return np.maximum(mu, 0.0).astype(float)
@@ -303,8 +344,32 @@ class SarimaxRegimeDemandForecaster(DemandForecaster):
         }
         return self
 
+    def _extract_recent_endog(self, info: Optional[dict]) -> Optional[np.ndarray]:
+        """Extract recent realized demand to seed SARIMAX autoregressive state.
+
+        Preference order:
+        1) info["demand_history"] (bounded vector from simulation)
+        2) info["last_demand"] (single value)
+        """
+
+        if not info:
+            return None
+
+        if "demand_history" in info:
+            vals = np.asarray(info["demand_history"], dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 1:
+                return np.maximum(vals, 0.0).astype(float)
+
+        if "last_demand" in info:
+            vals = np.asarray(info["last_demand"], dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 1:
+                return np.maximum(vals, 0.0).astype(float)
+
+        return None
+
     def forecast_mean_path(self, state: State, t: int, H: int, info: Optional[dict] = None) -> np.ndarray:
-        _ = info
         if not self._trained or self._results is None:
             raise RuntimeError("SarimaxRegimeDemandForecaster must be trained first.")
 
@@ -313,9 +378,257 @@ class SarimaxRegimeDemandForecaster(DemandForecaster):
             return np.zeros(0, dtype=float)
 
         Xh = self._prepare_exog(np.asarray(self.adapter.features_path(state, int(t), H), dtype=float))
+        recent_endog = self._extract_recent_endog(info)
+
+        if recent_endog is not None and recent_endog.size >= 1:
+            try:
+                # Re-anchor the SARIMAX AR state by re-running the Kalman filter
+                # over the recent realized demand observations, using the matching
+                # regime features for those steps.  This eliminates the frozen-state
+                # bias that arises when the training path ends in a different regime
+                # than the evaluation episode.
+                n_hist = int(recent_endog.size)
+                t_hist_start = int(t) - n_hist
+                X_recent = self._prepare_exog(
+                    np.asarray(
+                        self.adapter.features_path(state, t_hist_start, n_hist),
+                        dtype=float,
+                    )
+                )
+                updated = self._results.apply(endog=recent_endog, exog=X_recent, refit=False)
+                fc = updated.get_forecast(steps=H, exog=Xh)
+                mu = np.asarray(fc.predicted_mean, dtype=float).reshape(-1)
+                return np.maximum(mu, 0.0).astype(float)
+            except Exception:
+                pass  # fall through to legacy path
+
         fc = self._results.get_forecast(steps=H, exog=Xh)
         mu = np.asarray(fc.predicted_mean, dtype=float).reshape(-1)
         return np.maximum(mu, 0.0).astype(float)
 
 
-__all__ = ["EtsDemandForecaster", "SarimaxRegimeDemandForecaster"]
+class SarimaxDemandForecaster(DemandForecaster):
+    """Classical SARIMAX forecaster for constant or seasonal demand settings.
+
+    This class is the non-regime counterpart to ``SarimaxRegimeDemandForecaster``.
+    It supports:
+
+    - ``ConstantFeatureAdapter`` for constant-demand settings
+    - ``SeasonalFeatureAdapter`` for explicit time-feature seasonal settings
+
+    In the constant-demand case with ``trend="c"``, the constant adapter's intercept
+    column is dropped so the model reduces to a no-exog ARIMA/SARIMAX-style model.
+    """
+
+    def __init__(
+        self,
+        adapter: ConstantFeatureAdapter | SeasonalFeatureAdapter,
+        *,
+        order: tuple[int, int, int] = (1, 0, 0),
+        seasonal_order: tuple[int, int, int, int] = (0, 0, 0, 0),
+        trend: str = "c",
+        enforce_stationarity: bool = False,
+        enforce_invertibility: bool = False,
+    ):
+        self.adapter = adapter
+        self.order = tuple(int(v) for v in order)
+        self.seasonal_order = tuple(int(v) for v in seasonal_order)
+        self.trend = str(trend)
+        self.enforce_stationarity = bool(enforce_stationarity)
+        self.enforce_invertibility = bool(enforce_invertibility)
+        self._results = None
+        self._trained = False
+        self.fit_report: dict = {}
+
+    def _prepare_exog(self, X: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if X is None:
+            return None
+
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        if X.ndim != 2:
+            raise ValueError("SARIMAX exogenous features must be a 2-D array.")
+
+        if X.shape[1] >= 1 and self.trend != "n":
+            first_col = X[:, 0]
+            if np.allclose(first_col, 1.0, atol=1e-12, rtol=0.0):
+                X = X[:, 1:]
+
+        if X.shape[1] == 0:
+            return None
+        return X
+
+    @staticmethod
+    def _build_sarimax(
+        y: np.ndarray,
+        X: Optional[np.ndarray],
+        *,
+        order: tuple[int, int, int],
+        seasonal_order: tuple[int, int, int, int],
+        trend: str,
+        enforce_stationarity: bool,
+        enforce_invertibility: bool,
+    ):
+        try:
+            from statsmodels.tsa.statespace.sarimax import SARIMAX
+        except Exception as exc:
+            raise ImportError("SarimaxDemandForecaster requires statsmodels.") from exc
+
+        kwargs = dict(
+            endog=np.asarray(y, dtype=float).reshape(-1),
+            order=order,
+            seasonal_order=seasonal_order,
+            trend=trend,
+            enforce_stationarity=enforce_stationarity,
+            enforce_invertibility=enforce_invertibility,
+        )
+        if X is not None:
+            kwargs["exog"] = np.asarray(X, dtype=float)
+        return SARIMAX(**kwargs)
+
+    def _adapter_features_path(self, t: int, H: int) -> Optional[np.ndarray]:
+        if isinstance(self.adapter, ConstantFeatureAdapter):
+            X = self.adapter.features_path(int(t), int(H))
+        elif isinstance(self.adapter, SeasonalFeatureAdapter):
+            X = self.adapter.features_path(int(t), int(H))
+        else:  # pragma: no cover - defensive guard
+            raise TypeError("Unsupported adapter type for SarimaxDemandForecaster.")
+        return self._prepare_exog(np.asarray(X, dtype=float))
+
+    def fit(self, X: Optional[np.ndarray], y: np.ndarray):
+        X = self._prepare_exog(X)
+        y = np.asarray(y, dtype=float).reshape(-1)
+
+        model = self._build_sarimax(
+            y,
+            X,
+            order=self.order,
+            seasonal_order=self.seasonal_order,
+            trend=self.trend,
+            enforce_stationarity=self.enforce_stationarity,
+            enforce_invertibility=self.enforce_invertibility,
+        )
+        self._results = model.fit(disp=False)
+        self._trained = True
+        return self
+
+    def _predict_in_sample(self, X: Optional[np.ndarray]) -> np.ndarray:
+        if not self._trained or self._results is None:
+            raise RuntimeError("SarimaxDemandForecaster must be trained first.")
+        _ = self._prepare_exog(X)
+        return np.asarray(self._results.fittedvalues, dtype=float).reshape(-1)
+
+    def evaluate(self, X: Optional[np.ndarray], y: np.ndarray) -> dict:
+        X = self._prepare_exog(X)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        if not self._trained or self._results is None:
+            raise RuntimeError("SarimaxDemandForecaster must be trained first.")
+
+        try:
+            apply_kwargs = {"endog": y, "refit": False}
+            if X is not None:
+                apply_kwargs["exog"] = X
+            applied = self._results.apply(**apply_kwargs)
+            yhat = np.asarray(applied.fittedvalues, dtype=float).reshape(-1)
+        except Exception:
+            yhat = self._predict_in_sample(X)
+
+        yhat = np.maximum(yhat, 0.0)
+        return regression_metrics(y, yhat)
+
+    def fit_from_exogenous(
+        self,
+        *,
+        n_samples: int = 6000,
+        seed: int = 7,
+        t_start: int = 0,
+        val_samples: int = 1000,
+        val_seed: int = 99,
+        val_t_start: int = 8000,
+    ):
+        X_train, y_train = self.adapter.generate_dataset(n_samples=n_samples, seed=seed, t_start=t_start)
+        self.fit(X_train, y_train)
+
+        train_metrics = self.evaluate(X_train, y_train)
+        X_val, y_val = self.adapter.generate_dataset(n_samples=val_samples, seed=val_seed, t_start=val_t_start)
+        val_metrics = self.evaluate(X_val, y_val)
+
+        aic = None
+        bic = None
+        if self._results is not None:
+            aic = float(getattr(self._results, "aic", np.nan))
+            bic = float(getattr(self._results, "bic", np.nan))
+
+        X_train_prepared = self._prepare_exog(X_train)
+        effective_dim = 0 if X_train_prepared is None else int(X_train_prepared.shape[1])
+
+        self.fit_report = {
+            "model_type": "sarimax",
+            "order": self.order,
+            "seasonal_order": self.seasonal_order,
+            "trend": self.trend,
+            "feature_dim": effective_dim,
+            "aic": aic,
+            "bic": bic,
+            "train": {"n_samples": int(n_samples), "seed": int(seed), "t_start": int(t_start), **train_metrics},
+            "val": {"n_samples": int(val_samples), "seed": int(val_seed), "t_start": int(val_t_start), **val_metrics},
+        }
+        return self
+
+    def _extract_recent_endog(self, info: Optional[dict]) -> Optional[np.ndarray]:
+        if not info:
+            return None
+
+        if "demand_history" in info:
+            vals = np.asarray(info["demand_history"], dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 1:
+                return np.maximum(vals, 0.0).astype(float)
+
+        if "last_demand" in info:
+            vals = np.asarray(info["last_demand"], dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 1:
+                return np.maximum(vals, 0.0).astype(float)
+
+        return None
+
+    def forecast_mean_path(self, state: State, t: int, H: int, info: Optional[dict] = None) -> np.ndarray:
+        _ = state
+        if not self._trained or self._results is None:
+            raise RuntimeError("SarimaxDemandForecaster must be trained first.")
+
+        H = int(H)
+        if H <= 0:
+            return np.zeros(0, dtype=float)
+
+        Xh = self._adapter_features_path(int(t), H)
+        recent_endog = self._extract_recent_endog(info)
+
+        if recent_endog is not None and recent_endog.size >= 1:
+            try:
+                n_hist = int(recent_endog.size)
+                X_recent = self._adapter_features_path(int(t) - n_hist, n_hist)
+                apply_kwargs = {"endog": recent_endog, "refit": False}
+                if X_recent is not None:
+                    apply_kwargs["exog"] = X_recent
+                updated = self._results.apply(**apply_kwargs)
+                if Xh is not None:
+                    fc = updated.get_forecast(steps=H, exog=Xh)
+                else:
+                    fc = updated.get_forecast(steps=H)
+                mu = np.asarray(fc.predicted_mean, dtype=float).reshape(-1)
+                return np.maximum(mu, 0.0).astype(float)
+            except Exception:
+                pass
+
+        if Xh is not None:
+            fc = self._results.get_forecast(steps=H, exog=Xh)
+        else:
+            fc = self._results.get_forecast(steps=H)
+        mu = np.asarray(fc.predicted_mean, dtype=float).reshape(-1)
+        return np.maximum(mu, 0.0).astype(float)
+
+
+__all__ = ["EtsDemandForecaster", "SarimaxDemandForecaster", "SarimaxRegimeDemandForecaster"]
