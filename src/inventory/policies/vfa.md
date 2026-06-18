@@ -1,9 +1,10 @@
-# VFA policies (post-decision TD and fitted Q iteration)
+# VFA policies (post-decision TD, fitted post-decision value, and fitted Q iteration)
 
-This note explains the two VFA (value function approximation) policies implemented in
+This note explains the VFA (value function approximation) policies implemented in
 `inventory.policies.vfa` (see [vfa.py](vfa.py)):
 
 - `PostDecisionGreedyVfaPolicy` (online greedy policy using a post-decision VFA)
+- `PostDecisionFittedGreedyVfaPolicy` (batch/offline greedy policy using a fitted post-decision VFA)
 - `FqiGreedyVfaPolicy` (batch/offline fitted Q iteration for a discrete action set)
 
 Both are written in a “lecture style”:
@@ -53,6 +54,10 @@ They use:
     learns continuously while it interacts with the simulator (TD learning), and
     chooses actions by combining a one-step expected cost estimate with a learned
     post-decision value.
+
+- Use `PostDecisionFittedGreedyVfaPolicy` when you want the same post-decision
+  VFA structure, but prefer a batch/offline fitted-regression training loop over
+  online TD learning.
 
 - Use `FqiGreedyVfaPolicy` when you want a batch/offline method that:
     first collects a dataset of transitions, then trains a regression model for
@@ -245,6 +250,421 @@ function TRAIN_TD_VALUE(S0, T, n_episodes, seed0, epsilon):
 
 ---
 
+## `PostDecisionFittedGreedyVfaPolicy`
+
+### Concept: greedy post-decision VFA with fitted regression
+
+This policy keeps the **post-decision formulation** of `PostDecisionGreedyVfaPolicy`,
+but replaces the online TD weight update by **batch fitted regression**.
+
+The action rule is still greedy:
+
+$$x_t \in \arg\min_{x \in \mathcal{X}}\ \mathbb{E}[C(S_t, x, W_{t+1})] + \gamma\,\hat V(S_t^x, t)$$
+
+So the policy still:
+
+1. enumerates candidate order quantities,
+1. computes a deterministic Monte Carlo approximation of expected one-step cost,
+1. adds a learned post-decision continuation value,
+1. chooses the minimizing action.
+
+The difference is entirely in **how** $\hat V$ is trained.
+
+### Interface (`PostDecisionFittedGreedyVfaPolicy`)
+
+- `act(state, t, info=None) -> [x]`
+- `train_fitted_value(S0, T, n_episodes, seed0, n_iterations, behavior, eps_behavior) -> None`
+- `vbar_hat(S_post, t) -> float`
+
+Key configuration parameters include:
+
+- `mode`: regression backend
+- `feature`: either `"linear"` or `"poly2"`
+- `inv_scale`: positive scaling factor applied before feature construction
+- `expectation_samples`: Monte Carlo budget used inside greedy action evaluation
+
+### Features and value approximation
+
+The post-decision feature map is the same type of object as in
+`PostDecisionGreedyVfaPolicy`:
+
+$$\phi(S^{post}, t)$$
+
+and the value approximation is:
+
+$$\hat V(S^{post}, t) = f_\theta(\phi(S^{post}, t))$$
+
+where $f_\theta$ is now a fitted regression model rather than a simple linear
+weight vector updated by TD.
+
+As in the online post-decision policy:
+
+- `feature="linear"` uses a small linear basis
+- `feature="poly2"` adds quadratic and interaction terms
+- regime features are appended when the state contains a regime component
+- `inv_scale` helps keep the feature magnitudes numerically well behaved
+
+### Regression backends
+
+This policy supports the same fitted-regression backends as `FqiGreedyVfaPolicy`:
+
+- `ridge`
+- `elastic`
+- `decision_tree`
+- `tree`
+- `gbrt`
+- `mlp`
+
+So the model class can be linear or nonlinear, but the policy remains a **VFA**
+because it still approximates **downstream value**, not a direct action rule.
+
+In the current repo naming:
+
+- `decision_tree` means a classical single `DecisionTreeRegressor`
+- `tree` still means `HistGradientBoostingRegressor`
+- `gbrt` means classic `GradientBoostingRegressor`
+
+### Pseudocode: greedy action (`act`, PostDecisionFittedGreedyVfaPolicy)
+
+```text
+function ACT_PostDecisionFittedGreedyVfaPolicy(state, t, info=None):
+    xs ← {0, dx, 2dx, ..., x_max}
+
+    best_x ← xs[0]
+    best_obj ← +∞
+
+    for x in xs:
+        S_post ← MAKE_POST_STATE(state, x)
+        one_step ← EXPECTED_ONE_STEP_COST(state, x, t)
+        obj ← one_step + gamma * VBAR_HAT(S_post, t)
+
+        if obj < best_obj:
+            best_obj ← obj
+            best_x ← x
+
+    return [int(round(best_x))]
+```
+
+### Training: fitted post-decision value iteration (`train_fitted_value`)
+
+The training method first collects a batch of transitions, but stores the
+**post-decision state** associated with each chosen action:
+
+$$(S_t^x, t, C_t, S_{t+1}, t+1)$$
+
+It then performs repeated fitted Bellman-style updates.
+
+For each stored sample:
+
+- if the sample is terminal:
+  $$y_i = C_i$$
+
+- otherwise:
+  $$y_i = C_i + \gamma \hat V(S_{i+1}^{x^\star}, t_i+1)$$
+
+where $x^\star$ is the greedy next action at $S_{i+1}$ under the current fitted value model.
+
+The regression problem is therefore:
+
+$$\text{fit } f_\theta \text{ on } \big(\phi(S_i^{x_i}, t_i),\ y_i\big)$$
+
+Pseudocode:
+
+```text
+function TRAIN_FITTED_VALUE(S0, T, n_episodes, seed0, n_iterations, behavior, eps_behavior):
+    episode_seeds ← RNG(seed0).integers(...)  (n_episodes)
+
+    D ← empty list
+    xs ← {0, dx, ..., x_max}
+
+    # 1) Collect batch data
+    for ep_seed in episode_seeds:
+        step_seeds ← model.sample_crn_step_seeds(ep_seed, T)
+        S ← S0
+
+        for t in 0..T-1:
+            if behavior == "random":
+                x ← random choice from xs
+            else if behavior == "egreedy":
+                with prob eps_behavior: x ← random choice from xs
+                otherwise:             x ← ACT(S, t)[0]
+
+            X ← [int(round(x))]
+            S_post ← MAKE_POST_STATE(S, x)
+
+            rng_t ← default_rng(step_seeds[t])
+            W ← exogenous.sample(S, X, t, rng_t)
+            C ← cost_func(S, X, W, t)
+            S_next ← transition_func(S, X, W, t)
+
+            append (S_post, t, C, S_next, t+1) to D
+            S ← S_next
+
+    Phi ← stack_i phi(S_post_i, t_i)
+    c   ← vector of immediate costs
+
+    # 2) Fitted value iterations
+    for k in 1..n_iterations:
+        for each sample i in D:
+            if t_i is terminal:
+                y_i ← c_i
+            else:
+                x_next ← ACT(S_next_i, t_next_i)[0]
+                S_post_next ← MAKE_POST_STATE(S_next_i, x_next)
+                y_i ← c_i + gamma * VBAR_HAT(S_post_next, t_next_i)
+
+        fit value model on (Phi, y)
+
+    store fitted value model
+```
+
+### Notes (`PostDecisionFittedGreedyVfaPolicy` implementation details)
+
+- This policy is still **greedy** at action time.
+- It is still a **VFA** because it approximates post-decision downstream value.
+- It differs from `PostDecisionGreedyVfaPolicy` only in the **training method**:
+  online TD updates versus fitted batch regression.
+- It differs from `FqiGreedyVfaPolicy` in the **approximated object**:
+  post-decision value $\hat V(S^{post}, t)$ versus action value $\hat Q(S,t,x)$.
+- Because training is batch/offline, this class does not use a TD step-size
+  parameter like `alpha`.
+
+### Training-loop comparison: online TD post-decision VFA vs fitted post-decision VFA
+
+`PostDecisionGreedyVfaPolicy` and `PostDecisionFittedGreedyVfaPolicy` use the
+same greedy action idea and approximate the same Bellman object:
+
+$$\hat V(S_t^x, t)$$
+
+They differ only in **how** this post-decision value model is learned.
+
+#### `PostDecisionGreedyVfaPolicy`
+
+This class keeps an explicit linear weight vector and updates it immediately
+after each simulated transition:
+
+$$
+\delta_t = C_t + \gamma \hat V(S_{t+1}^{x^\star}, t+1) - \hat V(S_t^{x_t}, t)
+$$
+
+$$
+w \leftarrow w + \alpha\,\delta_t\,\phi(S_t^{x_t}, t)
+$$
+
+So the loop is:
+
+- simulate one step
+- compute the TD error
+- update the weight vector immediately
+
+This is an **online stochastic-approximation** learning rule.
+
+#### `PostDecisionFittedGreedyVfaPolicy`
+
+This class first collects a batch of post-decision transitions:
+
+$$
+\big(S_t^{x_t},\ t,\ C_t,\ S_{t+1},\ t+1\big)
+$$
+
+Then it repeatedly builds fitted Bellman targets:
+
+$$
+y_i =
+\begin{cases}
+C_i, & \text{terminal}\\
+C_i + \gamma \hat V(S_{i+1}^{x^\star}, t_i+1), & \text{otherwise}
+\end{cases}
+$$
+
+and refits a regression model on:
+
+$$
+\big(\phi(S_i^{x_i}, t_i),\ y_i\big)
+$$
+
+So the loop is:
+
+- collect a dataset of transitions
+- build targets for the whole batch
+- fit a regressor to the full batch
+- repeat for several Bellman passes
+
+This is a **batch fitted-regression** learning rule.
+
+#### Why these loops need to differ
+
+Unlike the comparison with `FqiGreedyVfaPolicy`, the reason here is **not**
+that the policies learn different Bellman objects. They do **not**.
+
+Both post-decision policies learn the same object:
+
+$$\hat V(S_t^x, t)$$
+
+The loops differ because the approximation architecture differs:
+
+- `PostDecisionGreedyVfaPolicy` is built around a linear weight vector `w`, so
+  a TD update of the form $w \leftarrow w + \alpha \delta \phi$ is natural.
+- `PostDecisionFittedGreedyVfaPolicy` is built to support generic regression
+  backends such as ridge, elastic net, trees, GBRT, and MLP, and these models
+  do not naturally admit that same one-step TD weight update.
+
+So once the implementation moves from “explicit linear weights” to “generic
+fitted regressor,” the training loop must also move from online TD updates to a
+batch fitted-regression procedure.
+
+### Practical regressor recommendation
+
+For `PostDecisionFittedGreedyVfaPolicy`, the safest starting choice is:
+
+- `mode="ridge"`
+
+Why ridge is the recommended default here:
+
+- the policy already has an expensive training loop because target construction
+  repeatedly calls the greedy policy
+- ridge is the fastest and most numerically stable regression backend in this class
+- the continuation value enters a greedy minimization step, so a smoother value
+  model is often easier to work with than a highly flexible one
+- with `feature="linear"` or `feature="poly2"` plus `inv_scale`, ridge already
+  provides a strong and interpretable teaching baseline
+
+A practical ordering is:
+
+1. `ridge`
+2. `elastic`
+3. `decision_tree` as the fastest nonlinear baseline
+4. `tree` or `gbrt` as exploratory richer boosted-tree variants
+
+In contrast, `mlp` is usually not the first backend to try in this class.
+
+### Training-loop comparison: fitted post-decision VFA vs FQI
+
+The most important practical difference between `PostDecisionFittedGreedyVfaPolicy`
+and `FqiGreedyVfaPolicy` is **not** the regression backend itself. It is the
+surrounding Bellman-update loop.
+
+#### `PostDecisionFittedGreedyVfaPolicy`
+
+This class approximates:
+
+$$\hat V(S_t^x, t)$$
+
+Training samples are collected as:
+
+$$\big(S_t^{x_t},\ t,\ C_t,\ S_{t+1},\ t+1\big)$$
+
+and targets are built as:
+
+$$
+y_i =
+\begin{cases}
+C_i, & \text{terminal}\\
+C_i + \gamma \hat V(S_{i+1}^{x^\star}, t_i+1), & \text{otherwise}
+\end{cases}
+$$
+
+where $x^\star$ is the next greedy action.
+
+The expensive step is that computing $x^\star$ requires calling the greedy
+post-decision policy:
+
+$$
+x^\star \in \arg\min_x \mathbb{E}[C(S,x,W)] + \gamma \hat V(S^x,t)
+$$
+
+That means target construction repeatedly performs:
+
+- action-grid enumeration
+- Monte Carlo estimation of expected one-step cost
+- fitted continuation-value evaluation
+
+So this class is expensive mainly because the **bootstrap target itself contains
+a small greedy planning problem**.
+
+#### `FqiGreedyVfaPolicy`
+
+This class approximates:
+
+$$\hat Q(S_t, t, x_t)$$
+
+Training samples are collected as:
+
+$$\big(S_t,\ t,\ x_t,\ C_t,\ S_{t+1},\ t+1\big)$$
+
+and targets are built as:
+
+$$
+y_i =
+\begin{cases}
+C_i, & \text{terminal}\\
+C_i + \gamma \min_{x'} \hat Q(S_{i+1}, t_i+1, x'), & \text{otherwise}
+\end{cases}
+$$
+
+Here the continuation term is cheaper to compute, because the algorithm only
+needs to:
+
+- evaluate `q_model.predict(...)` on the candidate action grid
+- take the minimum predicted Q-value
+
+There is **no Monte Carlo expected-cost calculation inside the bootstrap step**.
+
+#### Practical takeaway
+
+- `PostDecisionFittedGreedyVfaPolicy` learns a post-decision value model, but
+  target construction repeatedly solves a costly greedy post-decision planning step.
+- `FqiGreedyVfaPolicy` learns action values directly, so its bootstrap step is
+  closer to a standard batch supervised-learning loop.
+
+This is why richer regressors such as trees often feel more natural in
+`FqiGreedyVfaPolicy` than in `PostDecisionFittedGreedyVfaPolicy`.
+
+#### Why the loops must differ
+
+The two loops are not different by implementation taste alone. They differ
+because the policies learn **different Bellman objects**.
+
+- `PostDecisionFittedGreedyVfaPolicy` approximates
+  $$\hat V(S_t^x, t)$$
+  where the action has already been applied and the remaining uncertainty comes
+  afterward.
+- `FqiGreedyVfaPolicy` approximates
+  $$\hat Q(S_t, t, x_t)$$
+  where the action is part of the regressor input itself.
+
+That structural choice changes what the training target must contain.
+
+For the post-decision fitted policy, the target is of the form
+
+$$
+y = C_t + \gamma \hat V(S_{t+1}^{x^\star}, t+1)
+$$
+
+so training must first determine the **next greedy action** $x^\star$ from the
+next pre-decision state $S_{t+1}$.
+
+For FQI, the target is of the form
+
+$$
+y = C_t + \gamma \min_{x'} \hat Q(S_{t+1}, t+1, x')
+$$
+
+so the continuation step is computed directly by evaluating the current
+Q-regressor on the action grid.
+
+In short:
+
+- post-decision fitted VFA asks:
+  "What is the future value **after** I act?"
+- fitted Q iteration asks:
+  "What is the total value **if I take this action now**?"
+
+Because these are different mathematical objects, reusing the same training loop
+for both would mean fitting the wrong quantity.
+
+---
+
 ## `FqiGreedyVfaPolicy`
 
 ### Concept: fitted Q iteration (batch / offline)
@@ -294,14 +714,18 @@ It supports different regressors via `mode`:
 
 - `ridge` (with a NumPy fallback if sklearn is missing)
 - `elastic` (ElasticNet with scaling)
-- `tree` (hist gradient boosting)
+- `decision_tree` (single classical decision tree)
+- `tree` (histogram gradient boosting)
 - `gbrt` (classic gradient boosting)
 - `mlp` (MLP regressor with scaling)
+
+So `decision_tree` is the simple one-tree nonlinear baseline, while `tree` and
+`gbrt` are both boosted-tree ensembles.
 
 For `elastic` and `mlp`, the implementation also applies `StandardScaler` inside
 the sklearn pipeline. The explicit `inv_scale` and `a_scale` parameters are still
 useful for keeping the raw feature map numerically well behaved across modes,
-especially for `ridge`, `tree`, `gbrt`, and `poly2` features.
+especially for `ridge`, `decision_tree`, `tree`, `gbrt`, and `poly2` features.
 
 ### Pseudocode: greedy action (`act`, FqiGreedyVfaPolicy)
 
@@ -383,4 +807,5 @@ function TRAIN_FQI(S0, T, n_episodes, seed0, n_iterations, behavior, eps_behavio
 The module defines backwards-compatible names used in notebooks:
 
 - `PostDecision_Greedy_VFA` is an alias for `PostDecisionGreedyVfaPolicy`.
+- `PostDecision_Fitted_Greedy_VFA` is an alias for `PostDecisionFittedGreedyVfaPolicy`.
 - `FQI_Greedy_VFA` is an alias for `FqiGreedyVfaPolicy`.
