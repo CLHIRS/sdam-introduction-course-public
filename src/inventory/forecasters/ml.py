@@ -641,6 +641,7 @@ def _build_ml_backend(
     learning_rate: float = 0.05,
     max_depth: int = 3,
     tree_max_depth: int = 6,
+    min_samples_leaf: int = 1,
     alpha: float = 1e-3,
     l1_ratio: float = 0.5,
 ) -> tuple[str, object]:
@@ -650,7 +651,11 @@ def _build_ml_backend(
         try:
             from sklearn.tree import DecisionTreeRegressor
 
-            return model_type, DecisionTreeRegressor(max_depth=int(tree_max_depth), random_state=int(random_state))
+            return model_type, DecisionTreeRegressor(
+                max_depth=int(tree_max_depth),
+                min_samples_leaf=int(min_samples_leaf),
+                random_state=int(random_state),
+            )
         except Exception:
             model_type = "linear"
 
@@ -732,12 +737,26 @@ class MlDemandForecaster(DemandForecaster):
       - `mlp`:  MLPRegressor (if sklearn installed) else linear fallback
             - `elasticnet`: ElasticNet regressor (if sklearn installed) else linear fallback
       - `linear`: always use least-squares linear model
+
+    Tree-specific tuning:
+      - `tree_max_depth`: maximum depth for `model_type="tree"` (default 6)
+      - `min_samples_leaf`: minimum leaf size for `model_type="tree"` (default 1)
     """
 
-    def __init__(self, adapter: SeasonalFeatureAdapter, *, model_type: str = "tree", random_state: int = 0):
+    def __init__(
+        self,
+        adapter: SeasonalFeatureAdapter,
+        *,
+        model_type: str = "tree",
+        random_state: int = 0,
+        tree_max_depth: int = 6,
+        min_samples_leaf: int = 1,
+    ):
         self.adapter = adapter
         self.model_type = str(model_type).lower()
         self.random_state = int(random_state)
+        self.tree_max_depth = int(tree_max_depth)
+        self.min_samples_leaf = int(min_samples_leaf)
         self.model = None
         self._trained = False
         self.fit_report: dict = {}
@@ -745,7 +764,12 @@ class MlDemandForecaster(DemandForecaster):
         self._build_model_backend()
 
     def _build_model_backend(self) -> None:
-        self.model_type, self.model = _build_ml_backend(self.model_type, random_state=self.random_state)
+        self.model_type, self.model = _build_ml_backend(
+            self.model_type,
+            random_state=self.random_state,
+            tree_max_depth=self.tree_max_depth,
+            min_samples_leaf=self.min_samples_leaf,
+        )
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         X = np.asarray(X, dtype=float)
@@ -783,6 +807,8 @@ class MlDemandForecaster(DemandForecaster):
         self.fit_report = {
             "model_type": self.model_type,
             "random_state": self.random_state,
+            "tree_max_depth": self.tree_max_depth,
+            "min_samples_leaf": self.min_samples_leaf,
             "feature_dim": int(X_train.shape[1]),
             "train": {"n_samples": int(n_samples), "seed": int(seed), "t_start": int(t_start), **train_metrics},
             "val": {"n_samples": int(val_samples), "seed": int(val_seed), "t_start": int(val_t_start), **val_metrics},
@@ -811,12 +837,26 @@ class MlRegimeDemandForecaster(DemandForecaster):
             - `mlp`: MLPRegressor (if sklearn installed) else linear fallback
             - `elasticnet`: ElasticNet regressor (if sklearn installed) else linear fallback
             - `linear`: always use least-squares linear model
+
+        Tree-specific tuning:
+            - `tree_max_depth`: maximum depth for `model_type="tree"` (default 6)
+            - `min_samples_leaf`: minimum leaf size for `model_type="tree"` (default 1)
     """
 
-    def __init__(self, adapter: RegimeFeatureAdapter | MultiRegimeFeatureAdapter, *, model_type: str = "tree", random_state: int = 0):
+    def __init__(
+        self,
+        adapter: RegimeFeatureAdapter | MultiRegimeFeatureAdapter,
+        *,
+        model_type: str = "tree",
+        random_state: int = 0,
+        tree_max_depth: int = 6,
+        min_samples_leaf: int = 1,
+    ):
         self.adapter = adapter
         self.model_type = str(model_type).lower()
         self.random_state = int(random_state)
+        self.tree_max_depth = int(tree_max_depth)
+        self.min_samples_leaf = int(min_samples_leaf)
         self.model = None
         self._trained = False
         self.fit_report: dict = {}
@@ -824,7 +864,12 @@ class MlRegimeDemandForecaster(DemandForecaster):
         self._build_model_backend()
 
     def _build_model_backend(self) -> None:
-        self.model_type, self.model = _build_ml_backend(self.model_type, random_state=self.random_state)
+        self.model_type, self.model = _build_ml_backend(
+            self.model_type,
+            random_state=self.random_state,
+            tree_max_depth=self.tree_max_depth,
+            min_samples_leaf=self.min_samples_leaf,
+        )
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         X = np.asarray(X, dtype=float)
@@ -870,6 +915,8 @@ class MlRegimeDemandForecaster(DemandForecaster):
         self.fit_report = {
             "model_type": self.model_type,
             "random_state": self.random_state,
+            "tree_max_depth": self.tree_max_depth,
+            "min_samples_leaf": self.min_samples_leaf,
             "feature_dim": int(X_train.shape[1]),
             "train": {"n_samples": int(n_samples), "seed": int(seed), "t_start": int(t_start), **train_metrics},
             "val": {"n_samples": int(val_samples), "seed": int(val_seed), "t_start": int(val_t_start), **val_metrics},
@@ -975,8 +1022,16 @@ class MlAr1RegimeDemandForecaster(MlRegimeDemandForecaster):
         *,
         model_type: str = "tree",
         random_state: int = 0,
+        tree_max_depth: int = 6,
+        min_samples_leaf: int = 1,
     ):
-        super().__init__(adapter, model_type=model_type, random_state=random_state)
+        super().__init__(
+            adapter,
+            model_type=model_type,
+            random_state=random_state,
+            tree_max_depth=tree_max_depth,
+            min_samples_leaf=min_samples_leaf,
+        )
 
     @property
     def adapter(self) -> MultiRegimeAr1FeatureAdapter | ConstantAr1FeatureAdapter:  # type: ignore[override]

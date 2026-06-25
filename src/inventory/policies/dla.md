@@ -269,8 +269,56 @@ where:
 
 - Because rewards are negative costs, MCTS is searching for the lowest-cost actions.
 - The rollout policy is a simple order-up-to heuristic based on the model’s exogenous
-  structure (seasonal/regime Poisson). This keeps rollouts cheap.
+  structure:
+  - constant Poisson: use the constant mean `lambda_t(t)`
+  - seasonal Poisson: use the seasonal mean `lambda_t(t)`
+  - regime / multi-regime Poisson: use the one-step expected demand under the regime model
+  This keeps rollouts cheap while still giving a sensible continuation policy.
 - The final decision uses “most visited action” rather than “highest mean value”.
+
+---
+
+## `DlaMctsUctRolloutPolicy` (UCT with explicit rollout policy)
+
+### Concept
+
+This variant keeps the same UCT tree-search logic as `DlaMctsUctPolicy`, but it
+replaces the built-in rollout heuristic with an explicit policy object that
+follows the standard repository policy API:
+
+- `rollout_policy.act(state, t, info=None) -> [x]`
+
+The tree search still chooses the current action. The injected policy is only
+used to finish the simulated tail after expansion.
+
+### Interface
+
+- `act(state, t, info=None) -> [x]`
+- constructor adds:
+  - `rollout_policy`
+  - `rollout_history_window=0`
+
+### What the rollout policy receives
+
+Inside MCTS simulations, the rollout policy is called with simulated `info`
+that mirrors the main evaluation conventions as closely as possible:
+
+- `crn_step_seed`
+- `last_demand` after the first simulated demand is observed
+- `demand_history` when available and maintained
+
+This makes it possible to use rollout policies that depend on recent observed
+demand, not only on the current inventory state.
+
+### Difference from `HybridDlaRolloutBasePfaPolicy`
+
+- `HybridDlaRolloutBasePfaPolicy` evaluates candidate **first actions** by
+  rollout, then hands control to a base policy.
+- `DlaMctsUctRolloutPolicy` performs **UCT tree search** first, and only uses
+  the rollout policy beyond the explicit search frontier.
+
+So the new class is a configurable **default policy inside MCTS**, not a
+root-action rollout-improvement method.
 
 ---
 
@@ -280,3 +328,4 @@ The modules define backwards-compatible names used in older notebooks:
 
 - `DLA_MPC_MILP` is an alias for `DlaMpcMilpPolicy`.
 - `DLA_MCTS_UCT` is an alias for `DlaMctsUctPolicy`.
+- `DLA_MCTS_UCT_Rollout` is an alias for `DlaMctsUctRolloutPolicy`.

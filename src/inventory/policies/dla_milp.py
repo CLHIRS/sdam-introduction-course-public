@@ -43,6 +43,7 @@ class DlaMpcMilpPolicy(Policy):
     forecaster: Optional[DemandForecaster] = None
 
     def __post_init__(self) -> None:
+        # Core MPC horizon and action-grid controls.
         self.H = int(self.H)
         if self.H <= 0:
             raise ValueError("H must be >= 1")
@@ -55,12 +56,14 @@ class DlaMpcMilpPolicy(Policy):
         if self.S_max is not None:
             self.S_max = float(self.S_max)
 
+        # Economic coefficients used in the surrogate planning objective.
         self.p = float(self.p)
         self.c = float(self.c)
         self.h = float(self.h)
         self.b = float(self.b)
         self.K = float(self.K)
 
+        # Batch upper bound: x_k = dx*q_k and q_k <= q_max.
         self._q_max = int(np.floor(self.x_max / float(self.dx)))
 
     def __repr__(self) -> str:
@@ -76,12 +79,16 @@ class DlaMpcMilpPolicy(Policy):
     # mean-path forecast
     # -----------------
     def _expert_mean_path(self, state: State, t: int, H: int) -> np.ndarray:
+        # Expert deterministic surrogate demand path mu_0..mu_{H-1}.
         exo = self.model.exogenous_model
 
         if isinstance(exo, ExogenousPoissonSeasonal):
+            # Seasonal Poisson: mu_k = lambda_{t+k}.
             return np.array([float(exo.lambda_t(t + k)) for k in range(H)], dtype=float)
 
         if isinstance(exo, ExogenousPoissonRegime):
+            # Regime Poisson: propagate one-step Markov regime distribution and
+            # take expected demand rate at each lookahead step.
             r_t = int(np.round(float(state[exo.regime_index])))
             r_t = max(0, min(r_t, len(exo.lam_by_regime) - 1))
             dist = np.zeros(len(exo.lam_by_regime), dtype=float)
@@ -96,6 +103,7 @@ class DlaMpcMilpPolicy(Policy):
         return np.zeros(H, dtype=float)
 
     def _forecast_mean_path(self, state: State, t: int, H: int, info: Optional[dict]) -> np.ndarray:
+        # If an external forecaster exists, use it; otherwise use expert means.
         if self.forecaster is not None:
             mu = np.asarray(self.forecaster.forecast_mean_path(state, t, H, info=info), dtype=float).reshape(-1)
         else:
@@ -108,6 +116,8 @@ class DlaMpcMilpPolicy(Policy):
     # fallback heuristic
     # -----------------
     def _fallback_order(self, inv0: float, mu0: float) -> float:
+        # Certainty-equivalent order-up-to rule: x = max(0, mu0 - inv0),
+        # with caps and batching applied.
         x = max(0.0, float(mu0) - float(inv0))
         x = min(x, self.x_max)
         if self.S_max is not None:
@@ -120,6 +130,7 @@ class DlaMpcMilpPolicy(Policy):
     # Policy.act
     # -----------------
     def act(self, state: State, t: int, info: Optional[dict] = None) -> Action:
+        # Observe current inventory state and build deterministic lookahead demand path.
         inv0 = float(state[0])
         H = int(self.H)
         mu = self._forecast_mean_path(state, int(t), H, info)
@@ -130,6 +141,17 @@ class DlaMpcMilpPolicy(Policy):
             x0 = self._fallback_order(inv0, float(mu[0]) if len(mu) else 0.0)
             return np.array([x0], dtype=float)
 
+        # -----------------------------------------------------------------------
+        # scipy.optimize.milp form:
+        #   min cvec @ z
+        #   s.t. lb_con <= A @ z <= ub_con
+        #        lb <= z <= ub
+        # with integrality flags for integer variables.
+        #
+        # Packed variable vector z:
+        #   [q_0, y_0, s_0, l_0, ..., q_{H-1}, y_{H-1}, s_{H-1}, l_{H-1},
+        #    I_0, I_1, ..., I_H]
+        # -----------------------------------------------------------------------
         def idx_q(k: int) -> int:
             return 4 * k + 0
 
@@ -147,7 +169,8 @@ class DlaMpcMilpPolicy(Policy):
 
         n = 5 * H + 1
 
-        # objective vector (minimize)
+        # Objective (cost minimization surrogate):
+        # sum_k [c*dx*q_k + K*y_k + h*I_{k+1} + b*l_k - p*s_k]
         cvec = np.zeros(n, dtype=float)
         for k in range(H):
             cvec[idx_q(k)] = self.c * float(self.dx)
@@ -156,13 +179,13 @@ class DlaMpcMilpPolicy(Policy):
             cvec[idx_l(k)] = self.b
             cvec[idx_I(k + 1)] = self.h
 
-        # integrality for q and y
+        # Integrality: q_k integer batches, y_k binary (via bounds [0,1]).
         integrality = np.zeros(n, dtype=int)
         for k in range(H):
             integrality[idx_q(k)] = 1
             integrality[idx_y(k)] = 1
 
-        # bounds
+        # Variable bounds.
         lb = np.zeros(n, dtype=float)
         ub = np.full(n, np.inf, dtype=float)
         for k in range(H):
@@ -181,7 +204,7 @@ class DlaMpcMilpPolicy(Policy):
         for k in range(H + 1):
             lb[idx_I(k)] = 0.0
 
-        # fix initial inventory
+        # Fix initial planning inventory I_0 = inv0.
         lb[idx_I(0)] = inv0
         ub[idx_I(0)] = inv0
 
@@ -191,7 +214,8 @@ class DlaMpcMilpPolicy(Policy):
         lb_con = []
         ub_con = []
 
-        # (C1) s_k <= I_k + dx*q_k
+        # (C1) sales cannot exceed available stock after ordering:
+        #      s_k <= I_k + dx*q_k
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_s(k)] = 1.0
@@ -201,7 +225,8 @@ class DlaMpcMilpPolicy(Policy):
             lb_con.append(-np.inf)
             ub_con.append(0.0)
 
-        # (C2) s_k + l_k = mu_k
+        # (C2) demand split under deterministic surrogate demand:
+        #      s_k + l_k = mu_k
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_s(k)] = 1.0
@@ -211,7 +236,8 @@ class DlaMpcMilpPolicy(Policy):
             lb_con.append(rhs)
             ub_con.append(rhs)
 
-        # (C3) I_{k+1} = I_k + dx*q_k - s_k
+        # (C3) inventory flow balance:
+        #      I_{k+1} = I_k + dx*q_k - s_k
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_I(k + 1)] = 1.0
@@ -222,7 +248,8 @@ class DlaMpcMilpPolicy(Policy):
             lb_con.append(0.0)
             ub_con.append(0.0)
 
-        # (C4) link q and y
+        # (C4) setup-link constraints: y_k = 1 iff q_k > 0
+        #      q_k <= q_max*y_k  and  y_k <= q_k
         for k in range(H):
             row = np.zeros(n, dtype=float)
             row[idx_q(k)] = 1.0
@@ -238,7 +265,8 @@ class DlaMpcMilpPolicy(Policy):
             lb_con.append(-np.inf)
             ub_con.append(0.0)
 
-        # (C5) optional capacity (pre-demand on-hand): I_k + dx*q_k <= S_max
+        # (C5) optional capacity (pre-demand on-hand):
+        #      I_k + dx*q_k <= S_max
         if self.S_max is not None:
             for k in range(H):
                 row = np.zeros(n, dtype=float)
@@ -256,6 +284,7 @@ class DlaMpcMilpPolicy(Policy):
             x0 = self._fallback_order(inv0, float(mu[0]) if len(mu) else 0.0)
             return np.array([x0], dtype=float)
 
+        # Receding horizon execution: apply ONLY first planned order x_0 = dx*q_0.
         q0 = float(res.x[idx_q(0)])
         x0 = float(self.dx) * float(int(np.round(q0)))
         x0 = min(x0, self.x_max)
