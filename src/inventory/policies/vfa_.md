@@ -110,8 +110,7 @@ The feature map `phi` depends on:
 
 - inventory (always)
 - normalized time $\tau = t/50$ (always)
-- optional observable regime coordinates beyond inventory, e.g.
-  `[inventory, season, day, weather]`
+- optional regime component if the state is 2-D (`[inventory, regime]`)
 
 Two feature modes:
 
@@ -123,13 +122,8 @@ $I_t^{x,scaled} = I_t^x / \texttt{inv\_scale}$. This is mainly useful for
 `poly2`, where otherwise the quadratic term can become numerically large when
 inventory levels are in the hundreds.
 
-For regime states, the implementation uses all observable regime coordinates after
-inventory. When the exogenous model exposes known discrete cardinalities
-(for example `ExogenousPoissonRegime` or `ExogenousPoissonMultiRegime`), those
-coordinates are one-hot encoded; otherwise a simple polynomial fallback is used.
-The post-decision feature map also includes regime-inventory interactions so the
-greedy action can change across regimes rather than only shifting the value
-intercept.
+For regime states, if the exogenous model is `ExogenousPoissonRegime`, the regime
+feature is one-hot; otherwise it uses a simple polynomial in the regime value.
 
 ### Pseudocode: greedy action (`act`, PostDecisionGreedyVfaPolicy)
 
@@ -249,8 +243,7 @@ function TRAIN_TD_VALUE(S0, T, n_episodes, seed0, epsilon):
 
 - `act(...)` is deterministic given `(state, t)` because the expectation uses a
   deterministic seed.
-- The post-decision state keeps all observable regime coordinates (if present)
-  unchanged.
+- The post-decision state keeps the regime component (if present) unchanged.
 - If `w` is not initialized, the first call to `vbar_hat` allocates zeros.
 - `inv_scale=1.0` preserves the pre-scaling behavior; larger values can improve
     numerical stability for quadratic features without changing the policy API.
@@ -710,11 +703,6 @@ The policy featurizes state-action-time into a vector:
 $$\phi(S,t,x)$$
 
 with linear or quadratic (`poly2`) terms, plus optional regime features.
-For observable multi-regime states such as `[inventory, season, day, weather]`,
-the current implementation uses all regime coordinates after inventory. When
-their discrete cardinalities are known, they are one-hot encoded and augmented
-with regime-action and regime-inventory interactions so the greedy action can
-change across regimes.
 
 Before features are built, the inventory and action coordinates are scaled as
 $I_t^{scaled} = I_t / \texttt{inv\_scale}$ and $x_t^{scaled} = x_t / \texttt{a\_scale}$.

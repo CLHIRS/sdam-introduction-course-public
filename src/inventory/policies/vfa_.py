@@ -7,95 +7,7 @@ import numpy as np
 from inventory.core.dynamics import DynamicSystemMVP
 from inventory.core.policy import Policy
 from inventory.core.types import Action, State
-from inventory.problems.demand_models import (
-    ExogenousPoissonMultiRegime,
-    ExogenousPoissonRegime,
-    ExogenousPoissonSeasonal,
-)
-
-
-def _observable_regime_specs(model: DynamicSystemMVP, state_dim: int) -> List[Tuple[int, Optional[int]]]:
-    """Describe observable regime coordinates as (state_index, cardinality).
-
-    When the exogenous model exposes explicit discrete regime structure, use that
-    cardinality so the feature map can build one-hot blocks. Otherwise, fall back
-    to treating every non-inventory state coordinate as a generic numeric regime.
-    """
-
-    exo = model.exogenous_model
-
-    if isinstance(exo, ExogenousPoissonRegime):
-        specs = [(int(exo.regime_index), int(len(exo.lam_by_regime)))]
-    elif isinstance(exo, ExogenousPoissonMultiRegime):
-        specs = [
-            (int(exo.season_index), int(exo.P_season.shape[0])),
-            (int(exo.day_index), int(exo.P_day.shape[0])),
-            (int(exo.weather_index), int(exo.P_weather.shape[0])),
-        ]
-    else:
-        specs = [(i, None) for i in range(1, int(state_dim))]
-
-    filtered: List[Tuple[int, Optional[int]]] = []
-    seen = set()
-    for idx, card in specs:
-        idx = int(idx)
-        if idx <= 0 or idx >= int(state_dim) or idx in seen:
-            continue
-        seen.add(idx)
-        filtered.append((idx, None if card is None else int(card)))
-    return filtered
-
-
-def _append_post_regime_features(
-    base: List[float],
-    *,
-    model: DynamicSystemMVP,
-    S_post: np.ndarray,
-    inv: float,
-) -> None:
-    """Append regime blocks for post-decision value features.
-
-    Regime * inventory interactions are included so regime information can
-    actually affect the greedy action ranking through the post-decision value.
-    """
-
-    for idx, card in _observable_regime_specs(model, int(S_post.shape[0])):
-        r = float(S_post[idx])
-        if card is None or card <= 0:
-            base.extend([r, r * r, r * inv])
-            continue
-
-        r_idx = int(np.round(r))
-        r_idx = max(0, min(r_idx, card - 1))
-        one_hot = [0.0] * card
-        one_hot[r_idx] = 1.0
-        base.extend(one_hot)
-        base.extend([val * inv for val in one_hot])
-
-
-def _append_state_action_regime_features(
-    base: List[float],
-    *,
-    model: DynamicSystemMVP,
-    S: np.ndarray,
-    inv: float,
-    a: float,
-) -> None:
-    """Append regime blocks for Q-function features."""
-
-    for idx, card in _observable_regime_specs(model, int(S.shape[0])):
-        r = float(S[idx])
-        if card is None or card <= 0:
-            base.extend([r, r * r, r * a, r * inv])
-            continue
-
-        r_idx = int(np.round(r))
-        r_idx = max(0, min(r_idx, card - 1))
-        one_hot = [0.0] * card
-        one_hot[r_idx] = 1.0
-        base.extend(one_hot)
-        base.extend([val * a for val in one_hot])
-        base.extend([val * inv for val in one_hot])
+from inventory.problems.demand_models import ExogenousPoissonRegime, ExogenousPoissonSeasonal
 
 
 @dataclass
@@ -113,8 +25,7 @@ class PostDecisionGreedyVfaPolicy(Policy):
 
     Notes:
       - Deterministic MC approximation of the expectation to avoid adding policy RNG.
-      - Supports both 1D state [inventory] and observable multi-regime states
-        such as [inventory, season, day, weather].
+      - Supports both 1D state [inventory] and 2D [inventory, regime].
     """
 
     model: DynamicSystemMVP
@@ -176,7 +87,18 @@ class PostDecisionGreedyVfaPolicy(Policy):
             base = [1.0, inv, inv * inv, tau, tau * tau, inv * tau]
 
         if S_post.shape[0] >= 2:
-            _append_post_regime_features(base, model=self.model, S_post=S_post, inv=inv)
+            K = self._n_regimes()
+            if K <= 0:
+                # Generic numeric regime feature if regime cardinality is unknown.
+                r = float(S_post[1])
+                base.extend([r, r * r])
+            else:
+                # One-hot regime feature when ExogenousPoissonRegime is available.
+                r = int(np.round(float(S_post[1])))
+                r = max(0, min(r, K - 1))
+                one_hot = [0.0] * K
+                one_hot[r] = 1.0
+                base.extend(one_hot)
 
         return np.asarray(base, dtype=float)
 
@@ -203,11 +125,11 @@ class PostDecisionGreedyVfaPolicy(Policy):
 
     def _make_post_state(self, S: np.ndarray, x: float) -> np.ndarray:
         # Post-decision mapping S -> S^x used by the policy objective.
-        # All observable regime coordinates are carried forward unchanged.
+        # In 2D (inventory, regime), regime is carried forward unchanged.
         inv_post = max(0.0, float(S[0]) + float(x))
         if S.shape[0] == 1:
             return np.array([inv_post], dtype=float)
-        return np.concatenate(([inv_post], np.asarray(S[1:], dtype=float).copy()))
+        return np.array([inv_post, float(S[1])], dtype=float)
 
     def _seed_for_expectation(self, t: int, inv: float) -> int:
         # Deterministic seed from (t, inventory) so the expectation estimate
@@ -543,7 +465,16 @@ class PostDecisionFittedGreedyVfaPolicy(Policy):
             base = [1.0, inv, inv * inv, tau, tau * tau, inv * tau]
 
         if S_post.shape[0] >= 2:
-            _append_post_regime_features(base, model=self.model, S_post=S_post, inv=inv)
+            K = self._n_regimes()
+            if K <= 0:
+                r = float(S_post[1])
+                base.extend([r, r * r])
+            else:
+                r = int(np.round(float(S_post[1])))
+                r = max(0, min(r, K - 1))
+                one_hot = [0.0] * K
+                one_hot[r] = 1.0
+                base.extend(one_hot)
 
         return np.asarray(base, dtype=float)
 
@@ -581,7 +512,7 @@ class PostDecisionFittedGreedyVfaPolicy(Policy):
         inv_post = max(0.0, float(S[0]) + float(x))
         if S.shape[0] == 1:
             return np.array([inv_post], dtype=float)
-        return np.concatenate(([inv_post], np.asarray(S[1:], dtype=float).copy()))
+        return np.array([inv_post, float(S[1])], dtype=float)
 
     def _seed_for_expectation(self, t: int, inv: float) -> int:
         inv_key = int(np.round(inv))
@@ -725,8 +656,7 @@ class FqiGreedyVfaPolicy(Policy):
       a = argmin_{a} Q_hat(S, a)
 
     Notes:
-      - Supports both 1D inventory state and observable multi-regime states
-        such as [inventory, season, day, weather].
+      - Supports both 1D inventory state and 2D [inventory, regime] state.
       - Uses sklearn models when available; ridge has a numpy fallback.
     """
 
@@ -814,7 +744,18 @@ class FqiGreedyVfaPolicy(Policy):
             base = [1.0, inv, inv * inv, a, a * a, inv * a, tau, tau * tau, inv * tau, a * tau]
 
         if S.shape[0] >= 2:
-            _append_state_action_regime_features(base, model=self.model, S=S, inv=inv, a=a)
+            K = self._n_regimes()
+            if K <= 0:
+                # Generic regime coordinate if regime cardinality is unknown.
+                r = float(S[1])
+                base.extend([r, r * r, r * a, r * inv])
+            else:
+                # One-hot regime encoding when ExogenousPoissonRegime is available.
+                r = int(np.round(float(S[1])))
+                r = max(0, min(r, K - 1))
+                one_hot = [0.0] * K
+                one_hot[r] = 1.0
+                base.extend(one_hot)
 
         return np.asarray(base, dtype=float)
 
