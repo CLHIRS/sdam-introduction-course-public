@@ -3,12 +3,24 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Union
 
 import numpy as np
 from inventory.core.exogenous import ExogenousModel
 from inventory.core.policy import Policy
 from inventory.core.types import Action, Exog, State
+
+
+class _BeliefTracker(Protocol):
+    def reset(self) -> None: ...
+
+    def belief_vector(self) -> np.ndarray: ...
+
+    def belief_mean_lambda(self) -> float: ...
+
+    def belief_marginals(self): ...
+
+    def observe_step(self, observed_demand: float | int, t: int) -> np.ndarray: ...
 
 
 @dataclass(frozen=True)
@@ -51,6 +63,7 @@ class DynamicSystemMVP:
         d_x: Optional[int] = None,
         d_w: Optional[int] = None,
         demand_history_window: int = 0,
+        belief_tracker_factory: Optional[Callable[[], _BeliefTracker]] = None,
         # Notebook-API aliases (Lecture 01_d / Lecture 03_b)
         dS: Optional[int] = None,
         dX: Optional[int] = None,
@@ -73,6 +86,7 @@ class DynamicSystemMVP:
         self.demand_history_window = int(demand_history_window)
         if self.demand_history_window < 0:
             raise ValueError("demand_history_window must be nonnegative")
+        self.belief_tracker_factory = belief_tracker_factory
 
         # Optional dimension hints (lets you assert shapes)
         self.d_s = d_s if d_s is not None else dS
@@ -130,6 +144,7 @@ class DynamicSystemMVP:
         seed: Optional[int] = None,
         info: Optional[dict] = None,
         return_exog: bool = False,
+        return_step_info: bool = False,
     ):
         """One rollout engine. Provide ONE of step_seeds (strict CRN) or seed."""
         T = int(T)
@@ -158,18 +173,30 @@ class DynamicSystemMVP:
 
         actions_arr: Optional[np.ndarray] = None
         exogs_arr: Optional[np.ndarray] = None
+        step_infos_out: Optional[List[dict]] = [] if return_step_info else None
         last_demand: Optional[float] = None
         demand_history: deque[float] = deque(maxlen=self.demand_history_window) if self.demand_history_window > 0 else deque()
+        belief_tracker = self._make_episode_belief_tracker()
+
+        if hasattr(self.exogenous_model, "reset_episode"):
+            self.exogenous_model.reset_episode()
 
         for t in range(T):
             S_t = traj[t].copy()
 
             step_info = {} if info is None else dict(info)
             step_info["crn_step_seed"] = int(step_seeds[t])
+            if belief_tracker is not None:
+                step_info["belief_regimes"] = belief_tracker.belief_vector()
+                step_info["belief_mean_demand"] = float(belief_tracker.belief_mean_lambda())
+                step_info["belief_marginals"] = belief_tracker.belief_marginals()
             if last_demand is not None:
                 step_info["last_demand"] = float(last_demand)
             if demand_history:
                 step_info["demand_history"] = np.asarray(demand_history, dtype=float)
+            if step_infos_out is not None:
+                # Preserve the exact per-step information snapshot used at decision time.
+                step_infos_out.append(dict(step_info))
 
             X_t = policy.act(S_t, t, info=step_info)
             X_t = self._as_1d_float_array(X_t, "X_t")
@@ -187,6 +214,8 @@ class DynamicSystemMVP:
                 last_demand = float(W_tp1.reshape(-1)[0])
                 if self.demand_history_window > 0:
                     demand_history.append(last_demand)
+                if belief_tracker is not None:
+                    belief_tracker.observe_step(last_demand, t)
             if return_exog:
                 if exogs_arr is None:
                     d_w = int(W_tp1.shape[0])
@@ -205,12 +234,32 @@ class DynamicSystemMVP:
         if actions_arr is None:
             actions_arr = np.empty((0, self.d_x or 0), dtype=float)
 
+        if return_exog and step_infos_out is not None:
+            if exogs_arr is None:
+                exogs_arr = np.empty((0, self.d_w or 0), dtype=float)
+            return traj, costs, actions_arr, step_seeds, exogs_arr, step_infos_out
+
         if return_exog:
             if exogs_arr is None:
                 exogs_arr = np.empty((0, self.d_w or 0), dtype=float)
             return traj, costs, actions_arr, step_seeds, exogs_arr
 
+        if step_infos_out is not None:
+            return traj, costs, actions_arr, step_seeds, step_infos_out
+
         return traj, costs, actions_arr, step_seeds
+
+    def _make_episode_belief_tracker(self) -> Optional[_BeliefTracker]:
+        if self.belief_tracker_factory is None:
+            return None
+
+        tracker = self.belief_tracker_factory()
+        required = ("reset", "belief_vector", "belief_mean_lambda", "belief_marginals", "observe_step")
+        missing = [name for name in required if not hasattr(tracker, name)]
+        if missing:
+            raise TypeError(f"belief tracker is missing required methods: {missing}")
+        tracker.reset()
+        return tracker
 
     # -----------------------------
     # Public simulation methods
@@ -229,6 +278,26 @@ class DynamicSystemMVP:
     def simulate_crn(self, policy: Policy, S0: State, step_seeds: np.ndarray, *, info: Optional[dict] = None):
         T = len(step_seeds)
         return self._rollout(policy, S0, int(T), step_seeds=step_seeds, info=info, return_exog=False)
+
+    def simulate_with_trace(
+        self,
+        policy: Policy,
+        S0: State,
+        *,
+        T: int = 10,
+        seed: Optional[int] = None,
+        info: Optional[dict] = None,
+    ):
+        """Simulate one episode and retain the exact per-step info dicts used in policy.act(...)."""
+        return self._rollout(
+            policy,
+            S0,
+            int(T),
+            seed=seed,
+            info=info,
+            return_exog=True,
+            return_step_info=True,
+        )
 
     def collect_policies_crn_rollouts_mc(
         self,

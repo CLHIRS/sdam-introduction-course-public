@@ -68,14 +68,39 @@ The neural network does not see raw states directly.
 ### Interface
 
 - Constructor:
-  - `HybridPpoPolicy(d_s, s_max, x_max, dx, hidden, device, hparams, seed, deterministic_eval)`
+  - `HybridPpoPolicy(d_s, s_max, x_max, dx, hidden, device, hparams, seed, deterministic_eval, feature_adapter=None)`
 - Acting:
   - `act(state, t, info=None) -> [x]`
 - Training:
-  - `train_ppo(system, S0, T, n_episodes, seed0=..., verbose=True) -> losses_dict`
+  - `train_ppo(system, S0, T, n_episodes, seed0=..., verbose=True, info=None) -> losses_dict`
 - Save/restore (evaluation gate):
   - `get_params() -> dict`
   - `set_params(params) -> None`
+
+### Observation design
+
+The current implementation now separates:
+
+- the **PPO backbone**
+- from the **feature vector** fed into that backbone
+
+If `feature_adapter=None`, the policy falls back to the legacy raw-state
+behavior:
+
+```text
+observation = state[:d_s]
+```
+
+If a feature adapter is supplied, `HybridPpoPolicy` builds a
+`DecisionContext(state, t, info, system=None)` and delegates observation
+construction to that adapter.
+
+This makes it explicit which information is used by PPO, for example:
+
+- raw state only
+- raw state + `last_demand`
+- raw state + forecast path
+- later: raw state + demand history
 
 ### Network structure (conceptual)
 
@@ -202,15 +227,25 @@ function ACT_HybridPpoPolicy(state, t, info=None):
 
 ### Data collection
 
-The training method runs rollouts using `system.simulate(self, ...)`.
+The training method runs rollouts using `system.simulate_with_trace(self, ...)`.
 
 - It collects trajectories of length `T` for `n_episodes` episodes.
+- It also retains the exact per-step `step_info` dict that was passed into
+  `policy.act(...)`.
 - It stores per-step:
   - state $s_t$
   - chosen discrete action index $a_t$ (matching `action_grid`)
   - reward $r_t = -cost_t$
   - log-prob under the current policy $\log\pi_\theta(a_t\mid s_t)$
   - value estimate $V_\theta(s_t)$
+
+Important implication:
+
+- observation-time features
+- and training-time reconstructed features
+
+are now aligned even when the observation depends on `info`, such as
+`last_demand` or `demand_history`.
 
 ### Advantage estimation (GAE)
 
@@ -259,6 +294,10 @@ This file also provides an AlphaZero-style “accept/reject” loop:
 
 This is helpful in teaching contexts because it prevents training from
 accidentally “getting worse” due to optimizer noise.
+
+The helper also accepts an optional `train_info` argument, which is passed into
+`train_ppo(...)`. This is useful when a feature adapter or information model
+needs additional non-evaluation metadata during training.
 
 ---
 

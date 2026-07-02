@@ -7,6 +7,12 @@ import numpy as np
 from inventory.core.policy import Policy
 from inventory.core.types import Action, State
 from inventory.forecasters.base import DemandForecaster
+from inventory.policies.policy_features import (
+    DecisionContext,
+    ForecastPathFeatureAdapter,
+    PolicyFeatureAdapter,
+    RawStateFeatureAdapter,
+)
 
 try:
     import torch
@@ -119,6 +125,7 @@ class HybridPpoPolicy(Policy):
         hparams: PPOHyperParams = PPOHyperParams(),
         seed: int = 0,
         deterministic_eval: bool = False,
+        feature_adapter: Optional[PolicyFeatureAdapter] = None,
     ):
         if not _TORCH_AVAILABLE:
             raise ImportError("HybridPpoPolicy requires PyTorch (`pip install torch`).")
@@ -131,6 +138,8 @@ class HybridPpoPolicy(Policy):
 
         if self.dx <= 0:
             raise ValueError("dx must be >= 1")
+        if self.d_s <= 0:
+            raise ValueError("d_s must be >= 1")
         if self.x_max < 0 or self.s_max < 0:
             raise ValueError("x_max and s_max must be >= 0")
         if self.x_max % self.dx != 0:
@@ -143,18 +152,21 @@ class HybridPpoPolicy(Policy):
         self.hparams = hparams
         self.seed = int(seed)
         self.deterministic_eval = bool(deterministic_eval)
+        self.feature_adapter = feature_adapter if feature_adapter is not None else RawStateFeatureAdapter(raw_state_dim=self.d_s)
+        self.obs_dim = int(self.feature_adapter.feature_dim())
 
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        self.net = _ActorCriticNet(self.d_s, self.n_a, hidden=self.hidden).to(self.device)
+        self.net = _ActorCriticNet(self.obs_dim, self.n_a, hidden=self.hidden).to(self.device)
         self.opt = optim.Adam(self.net.parameters(), lr=float(self.hparams.lr))
-        self.norm = _RunningNorm(self.d_s)
+        self.norm = _RunningNorm(self.obs_dim)
 
     def __repr__(self) -> str:
         return (
             "HybridPpoPolicy("
-            f"d_s={self.d_s}, s_max={self.s_max}, x_max={self.x_max}, dx={self.dx}, "
+            f"d_s={self.d_s}, obs_dim={self.obs_dim}, feature_adapter={type(self.feature_adapter).__name__!r}, "
+            f"s_max={self.s_max}, x_max={self.x_max}, dx={self.dx}, "
             f"hidden={self.hidden}, device={str(self.device)!r}, seed={self.seed}, "
             f"deterministic_eval={self.deterministic_eval}, gamma={self.hparams.gamma}, "
             f"lr={self.hparams.lr}, n_epochs={self.hparams.n_epochs}, "
@@ -181,13 +193,30 @@ class HybridPpoPolicy(Policy):
     # -----------------------------
     # Internal helpers
     # -----------------------------
+    @staticmethod
+    def _decision_context(state: State, t: int, info: Optional[dict] = None) -> DecisionContext:
+        return DecisionContext(
+            state=np.asarray(state, dtype=np.float32).reshape(-1),
+            t=int(t),
+            info=info,
+            system=None,
+        )
+
     def _observation_vector(self, state: State, t: int, info: Optional[dict] = None) -> np.ndarray:
-        _ = t, info
-        return np.asarray(state, dtype=np.float32).reshape(-1)
+        obs = np.asarray(self.feature_adapter.features(self._decision_context(state, t, info=info)), dtype=np.float32).reshape(-1)
+        if obs.shape[0] != self.obs_dim:
+            raise ValueError(f"Feature adapter returned dim {obs.shape[0]} but expected {self.obs_dim}.")
+        return obs
 
     def _state_tensor(self, state: State, t: int = 0, info: Optional[dict] = None) -> Tensor:
         s = self.norm.normalize(self._observation_vector(state, t, info=info))
         return torch.tensor(s, dtype=torch.float32, device=self.device)
+
+    def feature_names(self) -> List[str]:
+        return list(self.feature_adapter.feature_names())
+
+    def describe_features(self) -> str:
+        return str(self.feature_adapter.describe())
 
     def _masked_logits(self, logits_1d: Tensor, inv: float) -> Tensor:
         feasible = (inv + self.action_grid.astype(np.float64)) <= (float(self.s_max) + 1e-9)
@@ -289,6 +318,7 @@ class HybridPpoPolicy(Policy):
         n_episodes: int,
         seed0: int = 1234,
         verbose: bool = True,
+        info: Optional[dict] = None,
     ) -> Dict[str, Any]:
         hp = self.hparams
         T = int(T)
@@ -304,15 +334,16 @@ class HybridPpoPolicy(Policy):
         rng = np.random.default_rng(int(seed0))
         episode_seeds = [int(s) for s in rng.integers(1, 2**31 - 1, size=n_episodes)]
 
-        self.norm.update(self._observation_vector(np.asarray(S0, dtype=np.float32), 0, info=None).astype(np.float64))
+        base_info = None if info is None else dict(info)
+        self.norm.update(self._observation_vector(np.asarray(S0, dtype=np.float32), 0, info=base_info).astype(np.float64))
 
         self.net.train()
         for ep_seed in episode_seeds:
-            traj, costs, acts, _ = system.simulate(self, S0, T=T, seed=ep_seed, info=None)
+            traj, costs, acts, _, _, step_infos = system.simulate_with_trace(self, S0, T=T, seed=ep_seed, info=base_info)
 
             r = (-costs).astype(np.float32)
             obs_traj = np.asarray(
-                [self._observation_vector(traj[tt].astype(np.float32), tt, info=None) for tt in range(T)],
+                [self._observation_vector(traj[tt].astype(np.float32), tt, info=step_infos[tt]) for tt in range(T)],
                 dtype=np.float32,
             )
             self.norm.update(obs_traj)
@@ -328,7 +359,7 @@ class HybridPpoPolicy(Policy):
                     raise ValueError(f"Encountered action {a_val} not on action_grid.")
                 a_idx = int(idxs[0])
 
-                s_t = self._state_tensor(raw_state_np, t=tt, info=None)
+                s_t = self._state_tensor(raw_state_np, t=tt, info=step_infos[tt])
                 logits, v = self.net(s_t)
                 logits = self._masked_logits(logits, inv)
                 dist = torch.distributions.Categorical(logits=logits)
@@ -475,7 +506,15 @@ class ForecastAugmentedHybridPpoPolicy(HybridPpoPolicy):
         if self.demand_scale <= 0.0:
             raise ValueError("demand_scale must be > 0")
 
-        d_obs = (self.raw_state_dim if self.include_raw_state else 0) + self.forecast_horizon
+        self._forecast_adapter = ForecastPathFeatureAdapter(
+            forecaster=self.forecaster,
+            raw_state_dim=self.raw_state_dim,
+            horizon=self.forecast_horizon,
+            demand_scale=self.demand_scale,
+            include_raw_state=self.include_raw_state,
+            clip_nonnegative=self.clip_forecast_nonnegative,
+        )
+        d_obs = self._forecast_adapter.feature_dim()
         super().__init__(
             d_s=d_obs,
             s_max=s_max,
@@ -486,6 +525,7 @@ class ForecastAugmentedHybridPpoPolicy(HybridPpoPolicy):
             hparams=hparams,
             seed=seed,
             deterministic_eval=deterministic_eval,
+            feature_adapter=self._forecast_adapter,
         )
 
     def __repr__(self) -> str:
@@ -500,28 +540,10 @@ class ForecastAugmentedHybridPpoPolicy(HybridPpoPolicy):
         )
 
     def _forecast_features(self, state: State, t: int, info: Optional[dict] = None) -> np.ndarray:
-        try:
-            mu = self.forecaster.forecast_mean_path(state, int(t), self.forecast_horizon, info=info)
-        except TypeError:
-            mu = self.forecaster.forecast_mean_path(state, int(t), self.forecast_horizon)
-        mu = np.asarray(mu, dtype=np.float32).reshape(-1)
-        if mu.shape[0] != self.forecast_horizon:
-            raise ValueError(
-                f"Forecaster returned shape {mu.shape}; expected ({self.forecast_horizon},)."
-            )
-        if self.clip_forecast_nonnegative:
-            mu = np.maximum(mu, 0.0)
-        return mu / np.float32(self.demand_scale)
+        return self._forecast_adapter.forecast_features(self._decision_context(state, t, info=info))
 
     def _observation_vector(self, state: State, t: int, info: Optional[dict] = None) -> np.ndarray:
-        raw_state = np.asarray(state, dtype=np.float32).reshape(-1)
-        if raw_state.shape[0] < self.raw_state_dim:
-            raise ValueError(f"State has dim {raw_state.shape[0]} but expected at least {self.raw_state_dim}.")
-        parts: List[np.ndarray] = []
-        if self.include_raw_state:
-            parts.append(raw_state[: self.raw_state_dim])
-        parts.append(self._forecast_features(raw_state, t, info=info))
-        return np.concatenate(parts, axis=0)
+        return super()._observation_vector(state, t, info=info)
 
 
 def train_ppo_with_eval_gate(
@@ -537,6 +559,7 @@ def train_ppo_with_eval_gate(
     eval_seed0: int = 999,
     train_seed0: int = 1234,
     eval_info: Optional[dict] = None,
+    train_info: Optional[dict] = None,
     verbose: bool = True,
 ) -> List[Dict[str, Any]]:
     """PPO training with an evaluation gate (AlphaZero-style accept/reject)."""
@@ -571,6 +594,7 @@ def train_ppo_with_eval_gate(
             n_episodes=int(chunk_episodes),
             seed0=int(train_seed0) + 10_000 * int(g),
             verbose=False,
+            info=train_info,
         )
 
         results, _ = system.evaluate_policies_crn_mc(
