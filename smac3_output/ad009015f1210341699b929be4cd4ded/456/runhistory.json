@@ -1,0 +1,61 @@
+{
+  "stats": {
+    "submitted": 2,
+    "finished": 2,
+    "running": 0
+  },
+  "data": [
+    {
+      "config_id": 1,
+      "instance": null,
+      "seed": 1068398491,
+      "budget": null,
+      "cost": -102.54333333333334,
+      "time": 0.0006809234619140625,
+      "cpu_time": 0.0006800000000000139,
+      "status": 1,
+      "starttime": 1783629905.293793,
+      "endtime": 1783629905.295261,
+      "additional_info": {}
+    },
+    {
+      "config_id": 2,
+      "instance": null,
+      "seed": 1068398491,
+      "budget": null,
+      "cost": -102.54333333333334,
+      "time": 0.00048613548278808594,
+      "cpu_time": 0.00048500000000029075,
+      "status": 1,
+      "starttime": 1783629905.86627,
+      "endtime": 1783629905.867397,
+      "additional_info": {}
+    }
+  ],
+  "configs": {
+    "1": {
+      "H_cfa": 6,
+      "H_mpc": 3,
+      "family": "order_up_to",
+      "horizon_mcts": 6,
+      "n_simulations_mcts": 43,
+      "theta": 29.327743537724,
+      "uct_c_mcts": 1.7436437189579,
+      "target_level": 55
+    },
+    "2": {
+      "H_cfa": 1,
+      "H_mpc": 4,
+      "family": "order_up_to",
+      "horizon_mcts": 4,
+      "n_simulations_mcts": 73,
+      "theta": 48.5600301220131,
+      "uct_c_mcts": 2.1571052625768,
+      "target_level": 57
+    }
+  },
+  "config_origins": {
+    "1": "Initial Design: Sobol",
+    "2": "Acquisition Function Maximizer: Local Search"
+  }
+}

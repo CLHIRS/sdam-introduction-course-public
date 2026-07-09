@@ -84,15 +84,31 @@ def smac3_available() -> bool:
     """Return True if the optional SMAC3 stack is importable."""
 
     try:
+        _patch_sklearn_tree_dtype_for_smac3()
         import ConfigSpace  # noqa: F401
         import smac  # noqa: F401
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, ImportError):
         return False
     return True
 
 
+def _patch_sklearn_tree_dtype_for_smac3() -> None:
+    """Patch the scikit-learn tree ABI that SMAC 2.4 still expects."""
+
+    try:
+        import sklearn.tree._tree as sklearn_tree
+    except ModuleNotFoundError:
+        return
+
+    if not hasattr(sklearn_tree, "DTYPE"):
+        # scikit-learn 1.9 removed this legacy alias, but SMAC 2.4 still imports it.
+        sklearn_tree.DTYPE = np.float32
+
+
 def _require_smac3() -> tuple[Any, Any, Any, Any, Any]:
     """Import SMAC3 + ConfigSpace lazily so the base repo stays usable without them."""
+
+    _patch_sklearn_tree_dtype_for_smac3()
 
     try:
         from ConfigSpace import AndConjunction, ConfigurationSpace, EqualsCondition
@@ -101,6 +117,13 @@ def _require_smac3() -> tuple[Any, Any, Any, Any, Any]:
         raise ModuleNotFoundError(
             "SMAC3 integration requires the optional `smac` dependency. "
             "Install it in this repository with `poetry add smac`."
+        ) from exc
+    except ImportError as exc:  # pragma: no cover - depends on the user's local optional stack
+        raise ImportError(
+            "Failed to import SMAC3. This repo restores the legacy "
+            "`sklearn.tree._tree.DTYPE` alias that SMAC 2.4 expects, so any "
+            "remaining ImportError likely means the optional `smac`/`scikit-learn` "
+            "stack needs reinstalling."
         ) from exc
 
     return ConfigurationSpace, EqualsCondition, AndConjunction, HyperparameterOptimizationFacade, Scenario

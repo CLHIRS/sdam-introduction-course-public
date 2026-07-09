@@ -1,0 +1,228 @@
+{
+    "name": "0c3916d047defc5a1bedb9f45d675c5c",
+    "deterministic": true,
+    "objectives": "cost",
+    "crash_cost": Infinity,
+    "termination_cost_threshold": Infinity,
+    "walltime_limit": Infinity,
+    "cputime_limit": Infinity,
+    "trial_walltime_limit": null,
+    "trial_memory_limit": null,
+    "n_trials": 50,
+    "use_default_config": false,
+    "instances": null,
+    "instance_features": null,
+    "adaptive_capping": false,
+    "adaptive_capping_slackfactor": null,
+    "runtime_cutoff": null,
+    "min_budget": null,
+    "max_budget": null,
+    "seed": 123,
+    "n_workers": 1,
+    "_meta": {
+        "facade": {
+            "name": "HyperparameterOptimizationFacade"
+        },
+        "runner": {
+            "name": "TargetFunctionRunner",
+            "code": "b'\\x95\\x12\\x97\\x00t\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00|\\x01\\xab\\x01\\x00\\x00\\x00\\x00\\x00\\x00}\\x02t\\x03\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00|\\x00\\x89\\x12\\x89\\x11\\x89\\x05\\x89\\x06\\x89\\x0e\\x89\\t\\x89\\x08\\x89\\r\\x89\\n\\x89\\x0c\\x89\\x0b\\xac\\x01\\xab\\x0c\\x00\\x00\\x00\\x00\\x00\\x00}\\x03t\\x05\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00|\\x03\\x89\\x12t\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x89\\x0f\\xab\\x01\\x00\\x00\\x00\\x00\\x00\\x00t\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x89\\x14\\xab\\x01\\x00\\x00\\x00\\x00\\x00\\x00t\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x89\\x16\\xab\\x01\\x00\\x00\\x00\\x00\\x00\\x00t\\x07\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x89\\x13\\xab\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x89\\x07\\x89\\x15\\x89\\x10\\xac\\x02\\xab\\t\\x00\\x00\\x00\\x00\\x00\\x00}\\x04t\\x07\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00|\\x04j\\x08\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\xab\\x01\\x00\\x00\\x00\\x00\\x00\\x00S\\x00'"
+        },
+        "model": {
+            "name": "RandomForest",
+            "types": [
+                6,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                3,
+                2,
+                4,
+                3,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ],
+            "bounds": [
+                [
+                    6,
+                    NaN
+                ],
+                [
+                    0,
+                    1.0
+                ],
+                [
+                    0,
+                    1.0
+                ],
+                [
+                    0,
+                    1.0
+                ],
+                [
+                    0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    3,
+                    NaN
+                ],
+                [
+                    2,
+                    NaN
+                ],
+                [
+                    4,
+                    NaN
+                ],
+                [
+                    3,
+                    NaN
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ],
+                [
+                    -1.0,
+                    1.0
+                ]
+            ],
+            "pca_components": 7,
+            "n_estimators": 10,
+            "cross_trees_variance": false,
+            "criterion": "squared_error",
+            "splitter": "random",
+            "max_depth": 1048576,
+            "min_samples_split": 2,
+            "min_samples_leaf": 1,
+            "min_weight_fraction_leaf": 0.0,
+            "max_leaf_nodes": 1048576,
+            "min_impurity_decrease": 1e-08,
+            "bootstrap": true,
+            "oob_score": false,
+            "n_jobs": -1,
+            "verbose": 0,
+            "warm_start": false,
+            "ccp_alpha": 0.0,
+            "max_samples": null,
+            "monotonic_cst": null,
+            "random_state": 123,
+            "max_features": 17,
+            "log_y": true
+        },
+        "acquisition_maximizer": {
+            "name": "LocalAndSortedRandomSearch",
+            "acquisition_function": {
+                "name": "EI",
+                "xi": 0.0,
+                "log": true
+            },
+            "challengers": 10000,
+            "seed": 123,
+            "random_search": {
+                "name": "RandomSearch",
+                "acquisition_function": {
+                    "name": "EI",
+                    "xi": 0.0,
+                    "log": true
+                },
+                "challengers": 5000,
+                "seed": 123
+            },
+            "local_search": {
+                "name": "LocalSearch",
+                "acquisition_function": {
+                    "name": "EI",
+                    "xi": 0.0,
+                    "log": true
+                },
+                "challengers": 5000,
+                "seed": 123,
+                "max_steps": null,
+                "n_steps_plateau_walk": 10,
+                "vectorization_min_obtain": 2,
+                "vectorization_max_obtain": 64,
+                "n_jobs": 1,
+                "stdev_init": 0.05,
+                "stdev_min": 0.005,
+                "stdev_max": null,
+                "upscale_thresh": 3,
+                "downscale_interval": 3
+            }
+        },
+        "acquisition_function": {
+            "name": "EI",
+            "xi": 0.0,
+            "log": true
+        },
+        "intensifier": {
+            "name": "Intensifier",
+            "max_incumbents": 10,
+            "max_config_calls": 3,
+            "seed": 123
+        },
+        "initial_design": {
+            "name": "SobolInitialDesign",
+            "n_configs": 12,
+            "n_configs_per_hyperparameter": 10,
+            "additional_configs": [],
+            "seed": 123
+        },
+        "random_design": {
+            "name": "ProbabilityRandomDesign",
+            "seed": 123,
+            "probability": 0.2
+        },
+        "runhistory_encoder": {
+            "name": "RunHistoryLogScaledEncoder",
+            "considered_states": [
+                1,
+                2,
+                4
+            ],
+            "lower_budget_states": [],
+            "scale_percentage": 5,
+            "seed": 123
+        },
+        "multi_objective_algorithm": null,
+        "config_selector": {
+            "name": "ConfigSelector",
+            "retrain_after": 8,
+            "max_new_config_tries": 16,
+            "min_trials": 1
+        },
+        "version": "2.4.0"
+    },
+    "output_directory": "smac3_output/0c3916d047defc5a1bedb9f45d675c5c/123"
+}
