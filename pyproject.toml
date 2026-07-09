@@ -34,7 +34,7 @@ scipy = "^1.17.0"
 ruff = "^0.15.4"
 pytest = "^9.0.2"
 statsmodels = "^0.14.6"
-
+smac = "^2.4.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
